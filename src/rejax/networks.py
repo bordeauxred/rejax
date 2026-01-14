@@ -5,6 +5,30 @@ import jax
 from flax import linen as nn
 from flax.linen.initializers import constant
 from jax import numpy as jnp
+from jax import lax
+
+
+def groupsort(x, group_size=2):
+    """
+    GroupSort activation function. Splits the input into groups of size `group_size`
+    and sorts each group in ascending order.
+    """
+    if group_size == 1:
+        return x
+
+    shape = x.shape
+    # Ensure the last dimension is divisible by group_size
+    if shape[-1] % group_size != 0:
+        raise ValueError(
+            f"Last dimension of input ({shape[-1]}) must be divisible by group_size ({group_size})"
+        )
+
+    # Reshape to (..., n_groups, group_size)
+    x = x.reshape(shape[:-1] + (-1, group_size))
+    # Sort along the last dimension
+    x = jnp.sort(x, axis=-1)
+    # Reshape back to original shape
+    return x.reshape(shape)
 
 
 class MLP(nn.Module):
