@@ -45,6 +45,7 @@ class TD3(
     target_noise: chex.Scalar = struct.field(pytree_node=True, default=0.2)
     target_noise_clip: chex.Scalar = struct.field(pytree_node=True, default=0.5)
     policy_delay: int = struct.field(pytree_node=False, default=2)
+    ortho_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.0)
 
     def make_act(self, ts):
         def act(obs, rng):
@@ -168,6 +169,13 @@ class TD3(
             (ts, placeholder_minibatch),
         )
         ts = self.train_policy(ts, minibatch, old_global_step)
+        
+        # Log ortho metrics if available (hacky transport via ts?? No, we need to return metrics)
+        # For now, we rely on debug prints or return it in info if we change signature.
+        # But `train_iteration` returns `ts`.
+        # We can store metrics in `ts` if we expanded `TrainState` or added a field.
+        # simpler: we just updated the loss functions to use the regularization.
+        
         return ts
 
     def train_critic(self, ts):
@@ -321,7 +329,15 @@ class TD3(
 
             loss_q1 = optax.l2_loss(q1, target).mean()
             loss_q2 = optax.l2_loss(q2, target).mean()
-            return loss_q1 + loss_q2
+            
+            # Add ortho loss
+            from rejax.regularization import compute_ortho_loss
+            # Log only occasionally to save compute
+            log_now = False # (ts.global_step % 1000 == 0) # TODO: Pass log_now freq
+            
+            ortho_loss, _ = compute_ortho_loss(params, self.ortho_lambda, log_now=log_now)
+            
+            return loss_q1 + loss_q2 + ortho_loss
 
         grads = jax.grad(critic_loss_fn)(ts.critic_ts.params)
         ts = ts.replace(critic_ts=ts.critic_ts.apply_gradients(grads=grads))
@@ -331,7 +347,15 @@ class TD3(
         def actor_loss_fn(params):
             action = self.actor.apply(params, minibatch.obs)
             q = self.vmap_critic(ts.critic_ts.params, minibatch.obs, action)
-            return -q.mean()
+            
+            # Add ortho loss
+            from rejax.regularization import compute_ortho_loss
+            # Log only occasionally
+            log_now = False 
+            
+            ortho_loss, _ = compute_ortho_loss(params, self.ortho_lambda, log_now=log_now)
+
+            return -q.mean() + ortho_loss
 
         grads = jax.grad(actor_loss_fn)(ts.actor_ts.params)
         ts = ts.replace(actor_ts=ts.actor_ts.apply_gradients(grads=grads))
