@@ -22,13 +22,14 @@ if __name__ == "__main__":
         "target_noise_clip": 0.5,
         "policy_delay": 2,
         # Orthogonalization Regularization
-        "ortho_lambda": 0.01,
+        "ortho_lambda": 0.2,
+        "log_expensive_freq": 500,
         # Network parameters with GroupSort
         "actor_kwargs": {"activation": "groupsort", "hidden_layer_sizes": (64, 64)},
         "critic_kwargs": {"activation": "groupsort", "hidden_layer_sizes": (64, 64)},
     }
     
-    wandb.init(project="rejax-plasticity", config=CONFIG, tags=["td3", "groupsort", "ortho"], mode="offline")
+    wandb.init(project="rejax-plasticity", config=CONFIG, tags=["td3", "groupsort", "ortho"], mode="online")
     
     # Create the agent
     print("Initializing TD3 with GroupSort and Orthogonalization...")

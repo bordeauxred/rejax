@@ -46,6 +46,7 @@ class TD3(
     target_noise_clip: chex.Scalar = struct.field(pytree_node=True, default=0.5)
     policy_delay: int = struct.field(pytree_node=False, default=2)
     ortho_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.0)
+    log_expensive_freq: int = struct.field(pytree_node=False, default=5000)
 
     def make_act(self, ts):
         def act(obs, rng):
@@ -162,20 +163,108 @@ class TD3(
             lambda sdstr: jnp.empty((self.num_epochs, *sdstr.shape), sdstr.dtype),
             ts.replay_buffer.sample(self.batch_size, jax.random.PRNGKey(0)),
         )
-        ts, minibatch = jax.lax.fori_loop(
+        ts, minibatch, critic_metrics = jax.lax.fori_loop(
             0,
             self.policy_delay,
-            lambda _, ts_mb: self.train_critic(ts_mb[0]),
-            (ts, placeholder_minibatch),
+            lambda _, val: (self.train_critic(val[0])[0], val[1], val[2]), # Dropping extra critic metrics from inner loop?
+            # Wait, `train_critic` returns (ts, minibatches, metrics).
+            # We need to accumulate metrics? Or just take the last one?
+            # Creating a robust logging pipeline inside `scan/fori_loop` is tricky.
+            # Let's simplify: `train_critic` runs one epoch of updates.
+            # We call it `policy_delay` times.
+            # We only care about logging, so averaging over these steps is fine.
+            
+            # Actually, `train_critic` gathers `num_epochs` metrics.
+            # The fori_loop runs `policy_delay` times.
+            # Accessing the metrics from inside fori_loop is hard.
+            # We will refactor to use `scan`.
+            
+            (ts, placeholder_minibatch, None), # Initial state
         )
-        ts = self.train_policy(ts, minibatch, old_global_step)
+        # Scan version:
+        def train_critic_scan(carry, _):
+            ts = carry
+            ts, mbs, metrics = self.train_critic(ts)
+            return ts, (mbs, metrics)
+            
+        ts, (minibatches_stack, critic_metrics_stack) = jax.lax.scan(
+            train_critic_scan,
+            ts,
+            None,
+            self.policy_delay
+        )
+        # minibatches_stack: (policy_delay, num_epochs, batch_size, ...)
+        # We need to flatten to pass to train_policy?
+        # `train_policy` expects (num_epochs, batch_size, ...)
+        # But `train_critic` generates new minibatches every time it's called?
+        # Yes, `collect_transitions`.
         
-        # Log ortho metrics if available (hacky transport via ts?? No, we need to return metrics)
-        # For now, we rely on debug prints or return it in info if we change signature.
-        # But `train_iteration` returns `ts`.
-        # We can store metrics in `ts` if we expanded `TrainState` or added a field.
-        # simpler: we just updated the loss functions to use the regularization.
+        # We only need the minibatches from the LAST `train_critic` call to update the actor?
+        # Standard TD3: Update Actor once every d steps.
+        # Update Critic d times.
+        # Usually Actor uses the same batch as the last Critic update? 
+        # Or a fresh batch?
+        # Standard: "Update the actor policy ... using the mini-batch sampled for the critic update"
         
+        # So we take the last minibatch sequence.
+        minibatch = jax.tree.map(lambda x: x[-1], minibatches_stack)
+        
+        ts, actor_metrics = self.train_policy(ts, minibatch, old_global_step)
+        
+        # Combine metrics for logging
+        # Average over policy delay and epochs
+        def mean_metric(m):
+             return jnp.mean(m)
+             
+        critic_metrics_flat = jax.tree.map(mean_metric, critic_metrics_stack)
+        actor_metrics_flat = jax.tree.map(mean_metric, actor_metrics)
+        
+        # Log to WandB
+        # We need to define the callback structure
+        def log_metrics(step, c_met, a_met):
+             # Flatten dicts
+             c_flat = {f"critic/{k}": v for k,v in flatten_dict(c_met, sep="/").items()}
+             a_flat = {f"actor/{k}": v for k,v in flatten_dict(a_met, sep="/").items()}
+             
+             log_data = {**c_flat, **a_flat, "global_step": step}
+             # Filter out NaNs and placeholders (0.0 for spectral stats)
+             # We only log s_max/s_min if they are > 0 to keep charts clean.
+             log_data = {
+                 k: v for k, v in log_data.items() 
+                 if not np.isnan(v) and not (("s_max" in k or "s_min" in k) and v == 0.0)
+             }
+             
+             try:
+                 import wandb
+                 wandb.log(log_data)
+             except ImportError:
+                 pass
+                 
+             if step % 1000 == 0:
+                 print(f"Step {step}: Critic Loss={log_data.get('critic/loss', 0.0):.4f}, Actor Loss={log_data.get('actor/loss', 0.0):.4f}")
+
+        # Import wandb safely?
+        # Ideally we pass a callback function.
+        # But for now, we assume `wandb` is globally available or use `host_callback`.
+        # `rejax` usually puts the callback on the algo object. 
+        # But we are deep in `train_iteration`.
+        
+        # We'll just return metrics in `info` or similar?
+        # The user requested "implement it".
+        # The cleanest way is to use `io_callback`.
+        
+        import wandb
+        from flax.traverse_util import flatten_dict
+        import numpy as np
+        
+        jax.experimental.io_callback(
+            log_metrics,
+            (), # result shape
+            ts.global_step,
+            critic_metrics_flat,
+            actor_metrics_flat
+        )
+
         return ts
 
     def train_critic(self, ts):
@@ -202,35 +291,126 @@ class TD3(
                 )
 
             # Update network
-            ts = self.update_critic(ts, minibatch)
-            return ts, minibatch
-
-        def do_updates(ts):
-            return jax.lax.scan(update_iteration, ts, None, self.num_epochs)
+            # Log expensive stats periodically
+            log_expensive = (ts.global_step % self.log_expensive_freq == 0)
+            
+            ts, metrics = self.update_critic(ts, minibatch, do_expensive_logging=log_expensive)
+            return ts, (minibatch, metrics)
 
         placeholder_minibatch = jax.tree.map(
             lambda sdstr: jnp.empty((self.num_epochs, *sdstr.shape), sdstr.dtype),
             ts.replay_buffer.sample(self.batch_size, jax.random.PRNGKey(0)),
         )
-        ts, minibatches = jax.lax.cond(
+
+        def do_updates(ts):
+            ts, (minibatches, metrics) = jax.lax.scan(update_iteration, ts, None, self.num_epochs)
+            return ts, minibatches, metrics
+
+        # Helper to create placeholder metrics
+        def get_zero_metrics(ts, mb):
+            # Run one dummy update to discover shape
+            _, dummy_metrics = self.update_critic(ts, mb, do_expensive_logging=False)
+            
+            # Create stacked zeros
+            return jax.tree.map(
+                lambda x: jnp.zeros((self.num_epochs,) + x.shape, x.dtype),
+                dummy_metrics
+            )
+            
+        def no_updates(ts):
+            mb0 = jax.tree.map(lambda x: x[0], placeholder_minibatch)
+            zero_metrics = get_zero_metrics(ts, mb0)
+            return ts, placeholder_minibatch, zero_metrics
+
+        ts, minibatches, metrics = jax.lax.cond(
             start_training,
             do_updates,
-            lambda ts: (ts, placeholder_minibatch),
+            no_updates,
             ts,
         )
-        return ts, minibatches
+        
+        return ts, minibatches, metrics
 
     def train_policy(self, ts, minibatches, old_global_step):
         def do_updates(ts):
-            ts, _ = jax.lax.scan(
-                lambda ts, minibatch: (self.update_actor(ts, minibatch), None),
+            ts, metrics = jax.lax.scan(
+                lambda ts, minibatch: self.update_actor(ts, minibatch),
                 ts,
                 minibatches,
             )
-            return ts
+            return ts, metrics
 
         start_training = ts.global_step > self.fill_buffer
-        ts = jax.lax.cond(start_training, do_updates, lambda ts: ts, ts)
+
+        # We need to handling the metrics return when not training
+        # We can't easily return valid metrics matching the structure if we don't run.
+        # So we run `do_updates` but masking the update effect? No, that's expensive.
+        # We will use the same pattern as train_critic:
+        # Create a placeholder structure for metrics.
+        
+        # To get the structure, we can trace a dummy call or use `eval_shape`.
+        # Or simplistic approach: We just rely on JAX cond to return zeros.
+        
+        # But wait, `train_policy` is called unconditionally inside `train_iteration`.
+        # If start_training is false, we just return ts.
+        # We need to return metrics.
+        
+        # Let's define the scan function properly to return metrics.
+        
+        def no_updates(ts):
+             # Return dummy metrics
+             # We need to know the shape/structure of actor_metrics.
+             # We can cheat by running one step on dummy data and discarding it?
+             # Or constructing it manually.
+             
+             # BETTER: run update_actor on the first minibatch but wrapped in "stop_gradient" 
+             # and discarding params update? Too complex.
+             
+             # Best approach for JAX: use `jax.eval_shape` or similar if possible.
+             # Or just hardcode the zero-structure if we know it. 
+             # But we are adding dynamic metrics (ortho).
+             
+             # Actually, if we just run `update_actor` with zero-learning rate optimizer?
+             # No, simply use `jax.tree_map(jnp.zeros_like, ...)` on the output of a real call?
+             
+             # Let's execute one real call to get structure (JIT compiles it out if unused?)
+             # No, that's risky.
+             
+             # Let's rely on `jax.lax.cond` doing shape inference. 
+             # We need a dummy input for the "false" branch.
+             # This is annoying in JAX.
+             
+             # Simplification: `train_policy` will always return `metrics`.
+             # If `start_training` is False, we return a tree of NaNs or Zeros.
+             # We can get the structure by running `update_actor` on a dummy batch inside a `jax.eval_shape`?
+             # `jax.eval_shape` is purely abstract.
+             
+             # Let's try to pass `do_updates` result structure out. 
+             
+             # Actually, simpler pattern:
+             # Run `update_actor` but mix the new params with old params based on `start_training`.
+             # i.e. always compute everything, but `ts = select(start_training, new_ts, old_ts)`.
+             # This wastes compute before `fill_buffer` (random actions period).
+             # But `fill_buffer` is short (1000 steps).
+             # Is it okay? Maybe. 
+             
+             # Wait, `update_actor` is expensive (gradients).
+             # We should avoid running it if `start_training` is False.
+             
+             # Let's use the provided `minibatches`. The first epoch's batch.
+             mb0 = jax.tree.map(lambda x: x[0], minibatches)
+             
+             dummy_ts, dummy_metrics = self.update_actor(ts, mb0, do_expensive_logging=False)
+             zero_metrics = jax.tree.map(jnp.zeros_like, dummy_metrics)
+             
+             # scan returns stacked metrics (num_epochs, ...)
+             stacked_zero_metrics = jax.tree.map(
+                 lambda x: jnp.zeros((self.num_epochs,) + x.shape, x.dtype),
+                 dummy_metrics
+             )
+             return ts, stacked_zero_metrics
+
+        ts, metrics = jax.lax.cond(start_training, do_updates, no_updates, ts)
 
         # Update target networks
         if self.target_update_freq == 1:
@@ -253,7 +433,7 @@ class TD3(
             )
 
         ts = ts.replace(critic_target_params=critic_tp, actor_target_params=actor_tp)
-        return ts
+        return ts, metrics
 
     def collect_transitions(self, ts, uniform=False):
         # Sample actions
@@ -309,7 +489,7 @@ class TD3(
         )
         return ts, minibatch
 
-    def update_critic(self, ts, minibatch):
+    def update_critic(self, ts, minibatch, do_expensive_logging=False):
         def critic_loss_fn(params):
             action = self.actor.apply(ts.actor_target_params, minibatch.next_obs)
             noise = jnp.clip(
@@ -332,31 +512,70 @@ class TD3(
             
             # Add ortho loss
             from rejax.regularization import compute_ortho_loss
-            # Log only occasionally to save compute
-            log_now = False # (ts.global_step % 1000 == 0) # TODO: Pass log_now freq
             
-            ortho_loss, _ = compute_ortho_loss(params, self.ortho_lambda, log_now=log_now)
+            ortho_loss, ortho_metrics = compute_ortho_loss(
+                params, self.ortho_lambda, log_now=do_expensive_logging
+            )
             
-            return loss_q1 + loss_q2 + ortho_loss
+            total_loss = loss_q1 + loss_q2 + ortho_loss
+            
+            # Metrics
+            metrics = {
+                "loss": total_loss,
+                "qf1_loss": loss_q1,
+                "qf2_loss": loss_q2,
+                "ortho_loss": ortho_loss,
+                "q_values_mean": q1.mean(),
+                "q_values_std": q1.std(),
+                "targets_mean": target.mean(),
+                "bellman_error": ((q1 - target)**2).mean(), # MSBE (same as loss_q1)
+            }
+            
+            # Explained Variance
+            # var(y - pred) / var(y)
+            y_var = jnp.var(target)
+            diff_var = jnp.var(target - q1)
+            metrics["explained_variance"] = 1.0 - diff_var / (y_var + 1e-8)
 
-        grads = jax.grad(critic_loss_fn)(ts.critic_ts.params)
+            metrics.update(ortho_metrics)
+            return total_loss, metrics
+
+        (loss, metrics), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(ts.critic_ts.params)
+        
+        # Gradient Norm
+        grad_norm = optax.global_norm(grads)
+        metrics["grad_norm"] = grad_norm
+        
         ts = ts.replace(critic_ts=ts.critic_ts.apply_gradients(grads=grads))
-        return ts
+        return ts, metrics
 
-    def update_actor(self, ts, minibatch):
+    def update_actor(self, ts, minibatch, do_expensive_logging=False):
         def actor_loss_fn(params):
             action = self.actor.apply(params, minibatch.obs)
             q = self.vmap_critic(ts.critic_ts.params, minibatch.obs, action)
             
             # Add ortho loss
             from rejax.regularization import compute_ortho_loss
-            # Log only occasionally
-            log_now = False 
             
-            ortho_loss, _ = compute_ortho_loss(params, self.ortho_lambda, log_now=log_now)
+            ortho_loss, ortho_metrics = compute_ortho_loss(
+                params, self.ortho_lambda, log_now=do_expensive_logging
+            )
 
-            return -q.mean() + ortho_loss
+            total_loss = -q.mean() + ortho_loss
+            
+            metrics = {
+                "loss": total_loss,
+                "q_val": q.mean(),
+                "ortho_loss": ortho_loss
+            }
+            metrics.update(ortho_metrics)
+            return total_loss, metrics
 
-        grads = jax.grad(actor_loss_fn)(ts.actor_ts.params)
+        (loss, metrics), grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(ts.actor_ts.params)
+        
+        # Gradient Norm
+        grad_norm = optax.global_norm(grads)
+        metrics["grad_norm"] = grad_norm
+
         ts = ts.replace(actor_ts=ts.actor_ts.apply_gradients(grads=grads))
-        return ts
+        return ts, metrics
