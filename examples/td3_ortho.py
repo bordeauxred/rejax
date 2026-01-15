@@ -24,15 +24,32 @@ if __name__ == "__main__":
         # Orthogonalization Regularization
         "ortho_lambda": 0.2,
         "log_expensive_freq": 500,
+        "seed": 0,
         # Network parameters with GroupSort
         "actor_kwargs": {"activation": "groupsort", "hidden_layer_sizes": (64, 64)},
         "critic_kwargs": {"activation": "groupsort", "hidden_layer_sizes": (64, 64)},
     }
     
-    wandb.init(project="rejax-plasticity", config=CONFIG, tags=["td3", "groupsort", "ortho"], mode="online")
+    # Determine Ortho Method
+    ortho_method = "gram" if CONFIG["ortho_lambda"] > 0 else "none"
+    activation = CONFIG["actor_kwargs"].get("activation", "swish")
+    seed = CONFIG.get("seed", 0)
+    
+    # Scientific Run Name
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"TD3_{CONFIG['env']}_{ortho_method}_λ{CONFIG['ortho_lambda']}_{activation}_s{seed}_{timestamp}"
+    
+    wandb.init(
+        project="rejax-plasticity", 
+        name=run_name,
+        config=CONFIG, 
+        tags=["td3", activation, ortho_method], 
+        mode="online"
+    )
     
     # Create the agent
-    print("Initializing TD3 with GroupSort and Orthogonalization...")
+    print(f"Initializing TD3: {run_name}")
     # rejax's .create() does not automatically pass unknown kwargs to the class 
     # unless they are defined fields. TD3 fields need to include ortho_lambda.
     # I added ortho_lambda to TD3 class definition.
