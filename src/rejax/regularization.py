@@ -18,8 +18,9 @@ def compute_ortho_loss(params, lambda_coeff, debug=False, log_now=False, exclude
     Returns: 
         (total_ortho_loss, layer_metrics)
     """
-    if lambda_coeff == 0.0:
-        return 0.0, {}
+    # Remove Python control flow on lambda_coeff as it might be traced
+    # if lambda_coeff == 0.0:
+    #     return 0.0, {}
 
     flat_params = flatten_dict(params, sep="/")
     ortho_loss = 0.0

@@ -1,3 +1,4 @@
+from typing import Any
 import chex
 import jax
 import numpy as np
@@ -5,6 +6,7 @@ import optax
 from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
+from flax.traverse_util import flatten_dict
 from jax import numpy as jnp
 
 from rejax.algos.algorithm import Algorithm, register_init
@@ -47,6 +49,8 @@ class TD3(
     policy_delay: int = struct.field(pytree_node=False, default=2)
     ortho_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.0)
     log_expensive_freq: int = struct.field(pytree_node=False, default=5000)
+    logger: Any = struct.field(pytree_node=False, default=None)
+    agent_id: int = struct.field(pytree_node=True, default=0)
 
     def make_act(self, ts):
         def act(obs, rng):
@@ -211,33 +215,35 @@ class TD3(
         
         ts, actor_metrics = self.train_policy(ts, minibatch, old_global_step)
         
-        # Combine metrics for logging
-        # Average over policy delay and epochs
+        # Combine metrics for logging (Restored)
         def mean_metric(m):
              return jnp.mean(m)
              
         critic_metrics_flat = jax.tree.map(mean_metric, critic_metrics_stack)
         actor_metrics_flat = jax.tree.map(mean_metric, actor_metrics)
         
-        # Log to WandB
-        # We need to define the callback structure
-        def log_metrics(step, c_met, a_met):
+        # Use custom logger if provided, else default to wandb
+        def log_metrics(step, c_met, a_met, agent_id):
              # Flatten dicts
              c_flat = {f"critic/{k}": v for k,v in flatten_dict(c_met, sep="/").items()}
              a_flat = {f"actor/{k}": v for k,v in flatten_dict(a_met, sep="/").items()}
-             
-             log_data = {**c_flat, **a_flat, "global_step": step}
-             # Filter out NaNs and placeholders (0.0 for spectral stats)
-             # We only log s_max/s_min if they are > 0 to keep charts clean.
-             log_data = {
-                 k: v for k, v in log_data.items() 
-                 if not np.isnan(v) and not (("s_max" in k or "s_min" in k) and v == 0.0)
-             }
-             
+
+             log_data = {**c_flat, **a_flat}
+             # For vmap compatibility, we avoid checking values of array-valued metrics here.
+             # Filtering must happen in the logger.
+
+             if self.logger is not None:
+                 # Pass to external logger (e.g. for vmapped aggregation)
+                 self.logger.log(log_data, step, agent_id)
+                 return
+
+             # Default WandB logging (only if wandb is initialized)
+             log_data["global_step"] = step
              try:
                  import wandb
-                 wandb.log(log_data)
-             except ImportError:
+                 if wandb.run is not None:
+                     wandb.log(log_data)
+             except (ImportError, Exception):
                  pass
                  
              if step % 1000 == 0:
@@ -246,23 +252,17 @@ class TD3(
         # Import wandb safely?
         # Ideally we pass a callback function.
         # But for now, we assume `wandb` is globally available or use `host_callback`.
-        # `rejax` usually puts the callback on the algo object. 
-        # But we are deep in `train_iteration`.
-        
-        # We'll just return metrics in `info` or similar?
-        # The user requested "implement it".
-        # The cleanest way is to use `io_callback`.
+        # `rejax` puts the callback on the algo object. 
         
         import wandb
-        from flax.traverse_util import flatten_dict
-        import numpy as np
         
         jax.experimental.io_callback(
             log_metrics,
-            (), # result shape
+            (),
             ts.global_step,
             critic_metrics_flat,
-            actor_metrics_flat
+            actor_metrics_flat,
+            self.agent_id
         )
 
         return ts
@@ -542,9 +542,13 @@ class TD3(
 
         (loss, metrics), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(ts.critic_ts.params)
         
-        # Gradient Norm
-        grad_norm = optax.global_norm(grads)
-        metrics["grad_norm"] = grad_norm
+        # Gradient Norms
+        metrics["grad_norm"] = optax.global_norm(grads)
+        flat_grads = flatten_dict(grads, sep="/")
+        for k, v in flat_grads.items():
+            if k.endswith("/kernel"):
+                layer_name = "_".join(k.split("/")[:-1])
+                metrics[f"diag/grad_norm_{layer_name}"] = jnp.linalg.norm(v)
         
         ts = ts.replace(critic_ts=ts.critic_ts.apply_gradients(grads=grads))
         return ts, metrics
@@ -573,9 +577,13 @@ class TD3(
 
         (loss, metrics), grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(ts.actor_ts.params)
         
-        # Gradient Norm
-        grad_norm = optax.global_norm(grads)
-        metrics["grad_norm"] = grad_norm
+        # Gradient Norms
+        metrics["grad_norm"] = optax.global_norm(grads)
+        flat_grads = flatten_dict(grads, sep="/")
+        for k, v in flat_grads.items():
+            if k.endswith("/kernel"):
+                layer_name = "_".join(k.split("/")[:-1])
+                metrics[f"diag/grad_norm_{layer_name}"] = jnp.linalg.norm(v)
 
         ts = ts.replace(actor_ts=ts.actor_ts.apply_gradients(grads=grads))
         return ts, metrics
