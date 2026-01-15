@@ -1,3 +1,17 @@
+"""
+Plasticity Study: Scaling Deep RL with Isometric Networks
+
+This script runs vectorized (vmapped) TD3 training across multiple seeds
+to study the effect of network depth, GroupSort activations, and orthogonal
+regularization on learning dynamics.
+
+Usage:
+    python examples/plasticity_study.py \
+        --num_seeds 4 --depths 2 4 8 16 32 \
+        --envs brax/halfcheetah brax/ant \
+        --activation groupsort --ortho_lambda 0.2
+"""
+
 import jax
 import wandb
 import jax.numpy as jnp
@@ -7,12 +21,43 @@ from rejax import TD3
 import datetime
 import argparse
 import time
+import subprocess
 from tensorboardX import SummaryWriter
 import os
-from typing import Any
+import json
+from typing import Any, Dict, Optional
 
 # Global registry to store loggers, avoiding serialization issues
 _LOGGER_REGISTRY = {}
+
+
+def get_system_info() -> Dict[str, Any]:
+    """Collect system information for reproducibility."""
+    info = {
+        "jax_version": jax.__version__,
+        "numpy_version": np.__version__,
+        "platform": jax.devices()[0].platform if jax.devices() else "cpu",
+        "device_count": jax.device_count(),
+        "devices": [str(d) for d in jax.devices()],
+    }
+
+    # Git info
+    try:
+        info["git_hash"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode("utf-8").strip()[:8]
+        info["git_branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode("utf-8").strip()
+        info["git_dirty"] = len(subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL
+        ).decode("utf-8").strip()) > 0
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        info["git_hash"] = "unknown"
+        info["git_branch"] = "unknown"
+        info["git_dirty"] = None
+
+    return info
 
 @jax.tree_util.register_pytree_node_class
 class ProxyLogger:
@@ -101,22 +146,28 @@ class BatchLogger:
                         
                     self.writers[aid].add_scalar(k, val, current_step)
 
-        # Log Mean and Std to WandB
+        # Log to WandB: individual seeds + aggregates
         if self.use_wandb and self.wandb_run:
-            agg_data = {"global_step": current_step}
+            wandb_data = {"global_step": current_step}
+
             for k, v_np in agg_values.items():
-                # Filter zeros for spectral stats
-                mask = np.ones_like(v_np, dtype=bool)
+                # Skip expensive stats placeholders (zeros)
                 if "s_max" in k or "s_min" in k:
-                    mask = (v_np != 0.0)
+                    if np.all(v_np == 0.0):
+                        continue
 
-                if mask.any():
-                    filtered = v_np[mask]
-                    agg_data[f"{k}/mean"] = np.mean(filtered)
-                    if len(filtered) > 1:
-                        agg_data[f"{k}/std"] = np.std(filtered)
+                # Log individual seed values
+                for i in range(min(num_items, self.num_seeds)):
+                    wandb_data[f"seed_{i}/{k}"] = float(v_np[i])
 
-            self.wandb_run.log(agg_data)
+                # Log aggregate (mean, std, min, max)
+                wandb_data[f"agg/{k}_mean"] = np.mean(v_np)
+                if len(v_np) > 1:
+                    wandb_data[f"agg/{k}_std"] = np.std(v_np)
+                    wandb_data[f"agg/{k}_min"] = np.min(v_np)
+                    wandb_data[f"agg/{k}_max"] = np.max(v_np)
+
+            self.wandb_run.log(wandb_data)
 
         if current_step % self.print_freq == 0:
              # Print critic loss for the first item in batch (or average?)
@@ -127,7 +178,8 @@ class BatchLogger:
         for w in self.writers:
             w.close()
 
-def run_experiment(config, num_seeds, base_log_dir, use_tb, use_wandb):
+def run_experiment(config, num_seeds, base_log_dir, use_tb, use_wandb,
+                   wandb_project="rejax-plasticity", wandb_entity=None):
     # Determine tags and names
     ortho_method = "gram" if config["ortho_lambda"] > 0 else "none"
     activation = config["actor_kwargs"].get("activation", "swish")
@@ -144,15 +196,33 @@ def run_experiment(config, num_seeds, base_log_dir, use_tb, use_wandb):
     if use_tb:
         print(f"Logging {num_seeds} seeds to TensorBoard at: {log_dir}")
     
+    # Collect system info for reproducibility
+    sys_info = get_system_info()
+
+    # Save full config to JSON for reproducibility
+    os.makedirs(log_dir, exist_ok=True)
+    full_config = {
+        **config,
+        "num_seeds": num_seeds,
+        "system_info": sys_info,
+        "timestamp": datetime.datetime.now().isoformat(),
+    }
+    config_path = os.path.join(log_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(full_config, f, indent=2, default=str)
+    print(f"Config saved to: {config_path}")
+
     wandb_run = None
     if use_wandb:
-        print(f"Logging aggregate metrics to WandB run: {run_name}")
+        print(f"Logging to WandB run: {run_name}")
         wandb_run = wandb.init(
-            project="rejax-plasticity",
+            project=wandb_project,
+            entity=wandb_entity,
             name=run_name,
             group=group_name,
-            config={**config, "num_seeds": num_seeds},
-            tags=[config["algo"], activation, ortho_method, config['env']],
+            config={**config, "num_seeds": num_seeds, **sys_info},
+            tags=[config["algo"], activation, ortho_method, config['env'], f"d{depth}"],
+            notes=f"Depth={depth}, Width={width}, Ortho={ortho_method}, Act={activation}",
             mode="online"
         )
 
@@ -162,9 +232,7 @@ def run_experiment(config, num_seeds, base_log_dir, use_tb, use_wandb):
     _LOGGER_REGISTRY[logger_id] = real_logger
     proxy_logger = ProxyLogger(logger_id)
     
-    # Create the agent template
-    # Create the agent template
-    # We create ONE agent template, then replicate properties to create a BATCH of agents manually
+    # Create ONE agent template, then replicate to create a BATCH of agents
     for key in ["algo", "seed", "global_seed"]: config.pop(key, None)
     
     # Create base instance (prototype)
@@ -195,7 +263,7 @@ def run_experiment(config, num_seeds, base_log_dir, use_tb, use_wandb):
         
     # Stack agents into a single PyTree batch
     # This is effectively "vmap" over the agent initialization
-    agent_batch = jax.tree_map(lambda *args: jnp.stack(args), *agents)
+    agent_batch = jax.tree.map(lambda *args: jnp.stack(args), *agents)
 
     # Vectorized Training!
     print(f"Starting Vectorized Study: {run_name}")
@@ -211,14 +279,31 @@ def run_experiment(config, num_seeds, base_log_dir, use_tb, use_wandb):
     jax.block_until_ready(ts)
     
     real_logger.close()
-    
+
     duration = time.time() - start_time
-    print(f"Finished {run_name} in {duration:.1f}s!")
-    
+    total_steps = config["total_timesteps"] * num_seeds
+    sps = total_steps / duration
+
+    print(f"Finished {run_name} in {duration:.1f}s ({sps:.0f} steps/sec)")
+
     if use_wandb:
-        wandb.log({"time/total_duration": duration, "time/sps": (config["total_timesteps"] * num_seeds) / duration})
+        # Log final summary metrics
+        wandb.log({
+            "time/total_duration_sec": duration,
+            "time/steps_per_second": sps,
+            "time/total_env_steps": total_steps,
+        })
+
+        # Mark run as finished with summary
+        wandb.summary["duration_sec"] = duration
+        wandb.summary["steps_per_second"] = sps
+        wandb.summary["total_env_steps"] = total_steps
+        wandb.summary["num_seeds"] = num_seeds
+        wandb.summary["depth"] = depth
+        wandb.summary["width"] = width
+
         wandb.finish()
-        
+
     del _LOGGER_REGISTRY[logger_id]
 
 if __name__ == "__main__":
@@ -237,7 +322,21 @@ if __name__ == "__main__":
     parser.add_argument("--logging", type=str, default="both", choices=["wandb", "tensorboard", "both"])
     parser.add_argument("--num_envs", type=int, default=64, help="Parallel envs per seed (GPU utilization)")
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--wandb_project", type=str, default="rejax-plasticity", help="WandB project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="WandB entity (team/user)")
+    parser.add_argument("--experiment_name", type=str, default=None, help="Optional experiment name prefix")
     args = parser.parse_args()
+
+    # Print system info at start
+    print("=" * 60)
+    print("PLASTICITY STUDY - Isometric Networks for Deep RL")
+    print("=" * 60)
+    sys_info = get_system_info()
+    print(f"JAX: {sys_info['jax_version']} | Platform: {sys_info['platform']} | Devices: {sys_info['device_count']}")
+    print(f"Git: {sys_info['git_hash']} ({sys_info['git_branch']}) {'[dirty]' if sys_info.get('git_dirty') else ''}")
+    print(f"Configs: {len(args.depths)} depths × {len(args.envs)} envs = {len(args.depths) * len(args.envs)} runs")
+    print(f"Seeds per config: {args.num_seeds} | Envs per seed: {args.num_envs}")
+    print("=" * 60)
 
     BASE_CONFIG = {
         "algo": args.algo,
@@ -268,4 +367,7 @@ if __name__ == "__main__":
             config["env"] = env_name
             config["actor_kwargs"] = {"activation": args.activation, "hidden_layer_sizes": (args.width,) * depth}
             config["critic_kwargs"] = {"activation": args.activation, "hidden_layer_sizes": (args.width,) * depth}
-            run_experiment(config, args.num_seeds, args.log_dir, use_tb, use_wandb)
+            run_experiment(
+                config, args.num_seeds, args.log_dir, use_tb, use_wandb,
+                wandb_project=args.wandb_project, wandb_entity=args.wandb_entity
+            )
