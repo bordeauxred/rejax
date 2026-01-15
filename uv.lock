@@ -2500,6 +2500,7 @@ dependencies = [
     { name = "jax" },
     { name = "optax" },
     { name = "pyyaml" },
+    { name = "wandb" },
 ]
 
 [package.optional-dependencies]
@@ -2531,6 +2532,7 @@ requires-dist = [
     { name = "navix", marker = "extra == 'compat'", specifier = ">=0.7.0" },
     { name = "optax", specifier = ">=0.2.3" },
     { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "wandb", specifier = ">=0.22.3" },
 ]
 provides-extras = ["compat"]
 
