@@ -86,14 +86,22 @@ class ProxyLogger:
 class BatchLogger:
     """
     Logger for vmapped training with ID-based attribution.
+
+    Handles both batched calls (all seeds at once) and individual calls
+    (one seed at a time, as happens with vmap + io_callback).
     """
-    def __init__(self, log_dir, num_seeds, print_freq=1000, wandb_run=None, use_tb=True, use_wandb=True):
+    def __init__(self, log_dir, num_seeds, print_freq=1000, wandb_run=None,
+                 use_tb=True, use_wandb=True, wandb_log_freq=100):
         self.writers = []
         self.use_tb = use_tb
         self.use_wandb = use_wandb
         self.num_seeds = num_seeds
         self.print_freq = print_freq
         self.wandb_run = wandb_run
+        self.wandb_log_freq = wandb_log_freq  # Only log to WandB every N steps
+
+        # Buffer for accumulating per-seed data for aggregate computation
+        self._step_buffer = {}  # {step: {seed_id: {metric: value}}}
 
         if self.use_tb:
             for i in range(num_seeds):
@@ -146,28 +154,56 @@ class BatchLogger:
                         
                     self.writers[aid].add_scalar(k, val, current_step)
 
-        # Log to WandB: individual seeds + aggregates
-        if self.use_wandb and self.wandb_run:
-            wandb_data = {"global_step": current_step}
+        # Log to WandB: individual seeds + aggregates (less frequently to avoid overhead)
+        if self.use_wandb and self.wandb_run and (current_step % self.wandb_log_freq == 0):
+            # Accumulate data in buffer for aggregate computation
+            if current_step not in self._step_buffer:
+                self._step_buffer[current_step] = {}
 
-            for k, v_np in agg_values.items():
-                # Skip expensive stats placeholders (zeros)
-                if "s_max" in k or "s_min" in k:
-                    if np.all(v_np == 0.0):
-                        continue
+            for i in range(num_items):
+                aid = int(id_np[i])
+                if 0 <= aid < self.num_seeds:
+                    if aid not in self._step_buffer[current_step]:
+                        self._step_buffer[current_step][aid] = {}
+                    for k, v_np in agg_values.items():
+                        # Skip expensive stats placeholders (zeros)
+                        if ("s_max" in k or "s_min" in k) and v_np[i] == 0.0:
+                            continue
+                        self._step_buffer[current_step][aid][k] = float(v_np[i])
 
-                # Log individual seed values
-                for i in range(min(num_items, self.num_seeds)):
-                    wandb_data[f"seed_{i}/{k}"] = float(v_np[i])
+            # Check if we have all seeds for this step
+            if len(self._step_buffer[current_step]) >= self.num_seeds:
+                wandb_data = {"global_step": current_step}
+                seed_data = self._step_buffer[current_step]
 
-                # Log aggregate (mean, std, min, max)
-                wandb_data[f"agg/{k}_mean"] = np.mean(v_np)
-                if len(v_np) > 1:
-                    wandb_data[f"agg/{k}_std"] = np.std(v_np)
-                    wandb_data[f"agg/{k}_min"] = np.min(v_np)
-                    wandb_data[f"agg/{k}_max"] = np.max(v_np)
+                # Get all metrics from first seed as reference
+                all_metrics = set()
+                for sid in seed_data:
+                    all_metrics.update(seed_data[sid].keys())
 
-            self.wandb_run.log(wandb_data)
+                for k in all_metrics:
+                    values = []
+                    for sid in range(self.num_seeds):
+                        if sid in seed_data and k in seed_data[sid]:
+                            val = seed_data[sid][k]
+                            wandb_data[f"seed_{sid}/{k}"] = val
+                            values.append(val)
+
+                    # Compute aggregates if we have data from multiple seeds
+                    if len(values) > 1:
+                        wandb_data[f"agg/{k}_mean"] = np.mean(values)
+                        wandb_data[f"agg/{k}_std"] = np.std(values)
+                        wandb_data[f"agg/{k}_min"] = np.min(values)
+                        wandb_data[f"agg/{k}_max"] = np.max(values)
+
+                self.wandb_run.log(wandb_data)
+
+                # Clean up old buffer entries to prevent memory growth
+                del self._step_buffer[current_step]
+                # Also clean any stale entries (shouldn't happen, but safety)
+                stale_steps = [s for s in self._step_buffer if s < current_step - 100]
+                for s in stale_steps:
+                    del self._step_buffer[s]
 
         if current_step % self.print_freq == 0:
              # Print critic loss for the first item in batch (or average?)
