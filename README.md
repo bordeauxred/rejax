@@ -143,3 +143,11 @@ Single file implementations:
   year={2024}
 } 
 ```
+
+
+##Setup
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv pip install "jax[cuda12]"
+uv pip install brax mujoco                                                     
+uv run wandb login
