@@ -5,7 +5,14 @@ PureJAXRL-style settings for maximum throughput comparison.
 Tests: MinAtar (Breakout, Asterix), Brax (HalfCheetah), Gymnax (Pendulum)
 
 Usage:
+    # Quick smoketest
+    python scripts/throughput_benchmark.py --envs Breakout-MinAtar --depths 2 4 --timesteps 100000
+
+    # Full benchmark (10M steps like purejaxrl)
     python scripts/throughput_benchmark.py --depths 2 4 8 16 32
+
+    # Brax with MJX backend
+    python scripts/throughput_benchmark.py --envs brax/halfcheetah --brax-backend mjx
 """
 import argparse
 import time
@@ -14,9 +21,35 @@ import jax.numpy as jnp
 from rejax import PPO
 
 
+def make_progress_callback(ppo, run_id, total_timesteps):
+    """Create a callback that prints progress during training."""
+    eval_callback = ppo.eval_callback
+    start_time = [time.time()]  # mutable container for closure
+
+    def progress_callback(ppo, train_state, rng):
+        lengths, returns = eval_callback(ppo, train_state, rng)
+
+        def log(step, lengths, returns):
+            elapsed = time.time() - start_time[0]
+            pct = 100 * step.item() / total_timesteps
+            steps_per_sec = step.item() / elapsed if elapsed > 0 else 0
+            print(f"    [{run_id}] {step.item():,}/{total_timesteps:,} ({pct:.0f}%) "
+                  f"| return={returns.mean().item():.1f} | {steps_per_sec:,.0f} steps/s")
+
+        jax.experimental.io_callback(
+            log, (), train_state.global_step, lengths, returns
+        )
+        return lengths, returns  # still return for final result
+
+    return progress_callback
+
+
 def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timesteps,
-                     brax_backend=None):
+                     brax_backend=None, eval_freq=None):
     """Benchmark a single configuration and return steps/second."""
+    depth = len(hidden_layers)
+    run_id = f"{env_name.replace('/', '_')}_d{depth}"
+
     # PureJAXRL-style config for max throughput
     config = {
         "env": env_name,
@@ -36,7 +69,7 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,     # purejaxrl default
         "total_timesteps": total_timesteps,
-        "eval_freq": total_timesteps,  # Only eval at end
+        "eval_freq": eval_freq if eval_freq else total_timesteps,
         "skip_initial_evaluation": True,
     }
 
@@ -45,13 +78,17 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
         config["env_params"] = {"backend": brax_backend}
 
     ppo = PPO.create(**config)
+
+    # Add progress callback for intermediate logging
+    if eval_freq and eval_freq > 0:
+        progress_callback = make_progress_callback(ppo, run_id, total_timesteps)
+        ppo = ppo.replace(eval_callback=progress_callback)
+
     keys = jax.random.split(jax.random.PRNGKey(0), num_seeds)
 
     # Compile
     vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
 
-    # Warmup compilation
-    depth = len(hidden_layers)
     print(f"  Compiling depth={depth} ({hidden_layers[0]}x{depth})...", end=" ", flush=True)
     start = time.time()
     ts, _ = vmap_train(ppo, keys)
@@ -59,13 +96,19 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
     compile_time = time.time() - start
     print(f"compiled in {compile_time:.1f}s")
 
-    # Benchmark (3 runs)
+    # Benchmark (3 runs, or 1 if logging progress)
+    num_runs = 1 if (eval_freq and eval_freq > 0) else 3
     times = []
-    for _ in range(3):
+    for i in range(num_runs):
+        if num_runs > 1:
+            print(f"    Run {i+1}/{num_runs}...", end=" ", flush=True)
         start = time.time()
         ts, _ = vmap_train(ppo, keys)
         jax.block_until_ready(ts)
-        times.append(time.time() - start)
+        elapsed = time.time() - start
+        times.append(elapsed)
+        if num_runs > 1:
+            print(f"{elapsed:.1f}s")
 
     avg_time = sum(times) / len(times)
     total_steps = total_timesteps * num_seeds
@@ -101,8 +144,10 @@ def main():
                         help="Parallel environments (purejaxrl high-throughput)")
     parser.add_argument("--num-seeds", type=int, default=3,
                         help="Parallel seeds (3 is enough for speed test)")
-    parser.add_argument("--timesteps", type=int, default=1_000_000,
-                        help="Timesteps per run")
+    parser.add_argument("--timesteps", type=int, default=10_000_000,
+                        help="Timesteps per run (purejaxrl default: 10M)")
+    parser.add_argument("--eval-freq", type=int, default=500_000,
+                        help="Progress print frequency (default: 500k, set 0 to disable)")
     parser.add_argument("--brax-backend", type=str, default="mjx",
                         choices=["mjx", "spring", "positional", "generalized"],
                         help="Brax physics backend: mjx (MuJoCo XLA, recommended), "
@@ -125,16 +170,21 @@ def main():
             try:
                 result = benchmark_config(
                     env, hidden, args.num_envs, args.num_seeds, args.timesteps,
-                    brax_backend=args.brax_backend
+                    brax_backend=args.brax_backend,
+                    eval_freq=args.eval_freq,
                 )
                 results.append(result)
                 print(f"  depth={depth}: {result['steps_per_second']:,.0f} steps/sec "
                       f"({result['steps_per_second_per_seed']:,.0f}/seed)")
 
                 if args.use_wandb:
-                    wandb.log(result)
+                    import wandb
+                    wandb.log({f"summary/{k}": v for k, v in result.items()
+                              if isinstance(v, (int, float))})
             except Exception as e:
                 print(f"  depth={depth}: FAILED - {e}")
+                import traceback
+                traceback.print_exc()
 
     # Summary table
     print("\n" + "="*80)
@@ -146,6 +196,7 @@ def main():
               f"{r['compile_time_s']:>10.1f}s")
 
     if args.use_wandb:
+        import wandb
         wandb.finish()
 
 
