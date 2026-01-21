@@ -57,10 +57,11 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
     depth = len(hidden_layers)
     width = hidden_layers[0]
 
-    # Create meaningful run_id: env_act_d{depth}_w{width}_ortho-{mode}
-    env_short = env_name.replace('/', '_').replace('-MinAtar', '')
-    ortho_str = f"_ortho-{ortho_mode}" if ortho_mode and ortho_mode != "none" else ""
-    run_id = f"{env_short}_{activation}_d{depth}_w{width}{ortho_str}"
+    # Descriptive run_id: env_act_d{depth}_ortho-{mode}
+    env_short = env_name.replace('-MinAtar', '').replace('/', '_')
+    act_short = activation[:4] if activation != "groupsort" else "gsort"
+    ortho_str = f"_{ortho_mode}" if ortho_mode and ortho_mode != "none" else ""
+    run_id = f"{env_short}_{act_short}_d{depth}{ortho_str}"
 
     # PureJAXRL-style config for max throughput
     config = {
