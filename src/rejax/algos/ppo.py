@@ -1,3 +1,5 @@
+from typing import Optional
+
 import chex
 import gymnax
 import jax
@@ -14,7 +16,8 @@ from rejax.algos.mixins import (
     NormalizeRewardsMixin,
     OnPolicyMixin,
 )
-from rejax.networks import DiscretePolicy, GaussianPolicy, VNetwork
+from rejax.networks import DiscretePolicy, GaussianPolicy, VNetwork, parse_activation_fn
+from rejax.regularization import compute_gram_regularization_loss, apply_ortho_update
 
 
 class Trajectory(struct.PyTreeNode):
@@ -41,6 +44,12 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     vf_coef: chex.Scalar = struct.field(pytree_node=True, default=0.5)
     ent_coef: chex.Scalar = struct.field(pytree_node=True, default=0.01)
 
+    # Orthonormalization settings
+    ortho_mode: Optional[str] = struct.field(pytree_node=False, default=None)  # None, "loss", "optimizer"
+    ortho_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.2)  # loss mode coefficient
+    ortho_coeff: chex.Scalar = struct.field(pytree_node=True, default=1e-3)  # optimizer mode coefficient
+    ortho_exclude_output: bool = struct.field(pytree_node=False, default=True)
+
     def make_act(self, ts):
         def act(obs, rng):
             if getattr(self, "normalize_observations", False):
@@ -59,7 +68,8 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
 
         agent_kwargs = config.pop("agent_kwargs", {})
         activation = agent_kwargs.pop("activation", "swish")
-        agent_kwargs["activation"] = getattr(nn, activation)
+        # Use parse_activation_fn to support groupsort variants
+        agent_kwargs["activation"] = parse_activation_fn(activation)
 
         hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
         agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
@@ -206,10 +216,34 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             pi_loss1 = ratio * advantages
             pi_loss2 = clipped_ratio * advantages
             pi_loss = -jnp.minimum(pi_loss1, pi_loss2).mean()
-            return pi_loss - self.ent_coef * entropy
+
+            total_loss = pi_loss - self.ent_coef * entropy
+
+            # Add ortho loss if in loss mode
+            if self.ortho_mode == "loss":
+                ortho_loss, _ = compute_gram_regularization_loss(
+                    params,
+                    lambda_coeff=self.ortho_lambda,
+                    exclude_output=self.ortho_exclude_output,
+                )
+                total_loss = total_loss + ortho_loss
+
+            return total_loss
 
         grads = jax.grad(actor_loss_fn)(ts.actor_ts.params)
-        return ts.replace(actor_ts=ts.actor_ts.apply_gradients(grads=grads))
+        new_actor_ts = ts.actor_ts.apply_gradients(grads=grads)
+
+        # Apply ortho update if in optimizer mode
+        if self.ortho_mode == "optimizer":
+            new_params = apply_ortho_update(
+                new_actor_ts.params,
+                lr=self.learning_rate,
+                ortho_coeff=self.ortho_coeff,
+                exclude_output=self.ortho_exclude_output,
+            )
+            new_actor_ts = new_actor_ts.replace(params=new_params)
+
+        return ts.replace(actor_ts=new_actor_ts)
 
     def update_critic(self, ts, batch):
         def critic_loss_fn(params):
@@ -220,10 +254,34 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             value_losses = jnp.square(value - batch.targets)
             value_losses_clipped = jnp.square(value_pred_clipped - batch.targets)
             value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-            return self.vf_coef * value_loss
+
+            total_loss = self.vf_coef * value_loss
+
+            # Add ortho loss if in loss mode
+            if self.ortho_mode == "loss":
+                ortho_loss, _ = compute_gram_regularization_loss(
+                    params,
+                    lambda_coeff=self.ortho_lambda,
+                    exclude_output=self.ortho_exclude_output,
+                )
+                total_loss = total_loss + ortho_loss
+
+            return total_loss
 
         grads = jax.grad(critic_loss_fn)(ts.critic_ts.params)
-        return ts.replace(critic_ts=ts.critic_ts.apply_gradients(grads=grads))
+        new_critic_ts = ts.critic_ts.apply_gradients(grads=grads)
+
+        # Apply ortho update if in optimizer mode
+        if self.ortho_mode == "optimizer":
+            new_params = apply_ortho_update(
+                new_critic_ts.params,
+                lr=self.learning_rate,
+                ortho_coeff=self.ortho_coeff,
+                exclude_output=self.ortho_exclude_output,
+            )
+            new_critic_ts = new_critic_ts.replace(params=new_params)
+
+        return ts.replace(critic_ts=new_critic_ts)
 
     def update(self, ts, batch):
         ts = self.update_actor(ts, batch)
