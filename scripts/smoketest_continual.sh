@@ -52,8 +52,8 @@ echo "  - With wandb logging"
 echo ""
 
 uv run python scripts/bench_continual.py \
-    --steps-per-game 100000 \
-    --num-cycles 1 \
+    --steps-per-game 50000 \
+    --num-cycles 2 \
     --num-seeds 2 \
     --configs baseline ortho_adamo ortho_adamo_lyle_lr \
     --use-wandb \
