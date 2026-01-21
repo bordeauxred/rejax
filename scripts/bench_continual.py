@@ -23,12 +23,13 @@ import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import gymnax
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from flax import serialization, struct
 from flax.training.train_state import TrainState
 from gymnax.environments.minatar.breakout import MinBreakout
@@ -124,6 +125,25 @@ def create_padded_env(game_name: str) -> Tuple[PaddedMinAtarEnv, Any]:
     return padded_env, padded_env.default_params
 
 
+def create_lyle_lr_schedule(initial_lr: float, final_lr: float, total_steps: int):
+    """
+    Lyle et al. linear decay schedule: 6.25e-5 → 1e-6.
+
+    Args:
+        initial_lr: Starting learning rate (e.g., 6.25e-5)
+        final_lr: Final learning rate (e.g., 1e-6)
+        total_steps: Total number of gradient steps
+
+    Returns:
+        optax schedule function
+    """
+    return optax.linear_schedule(
+        init_value=initial_lr,
+        end_value=final_lr,
+        transition_steps=total_steps,
+    )
+
+
 def create_ppo_config(
     env,
     env_params,
@@ -134,6 +154,8 @@ def create_ppo_config(
     activation: str = "tanh",
     lr_schedule: str = "constant",
     learning_rate: float = 2.5e-4,
+    final_lr: float = 1e-6,
+    use_bias: bool = True,
     num_envs: int = 2048,
     eval_freq: int = 500_000,
 ) -> Dict:
@@ -142,8 +164,9 @@ def create_ppo_config(
         "env": env,
         "env_params": env_params,
         "agent_kwargs": {
-            "hidden_layer_sizes": (256, 256),
+            "hidden_layer_sizes": (256, 256, 256, 256),  # 4 layers per Lyle et al.
             "activation": activation,
+            "use_bias": use_bias,
         },
         "num_envs": num_envs,
         "num_steps": 128,
@@ -175,20 +198,27 @@ EXPERIMENT_CONFIGS = [
         "ortho_mode": None,
         "activation": "tanh",
         "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "use_bias": True,
     },
     {
-        "name": "ortho_opt",
+        "name": "ortho_adamo",
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "groupsort",
         "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "use_bias": False,  # Disable bias for ortho experiments
     },
     {
-        "name": "ortho_opt_linear_lr",
+        "name": "ortho_adamo_lyle_lr",
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "groupsort",
         "lr_schedule": "linear",
+        "learning_rate": 6.25e-5,   # Lyle et al. initial LR
+        "final_lr": 1e-6,           # Lyle et al. final LR
+        "use_bias": False,  # Disable bias for ortho experiments
     },
 ]
 
@@ -269,6 +299,9 @@ class ContinualTrainer:
             ortho_coeff=self.experiment_config.get("ortho_coeff", 0.1),
             activation=self.experiment_config.get("activation", "tanh"),
             lr_schedule=self.experiment_config.get("lr_schedule", "constant"),
+            learning_rate=self.experiment_config.get("learning_rate", 2.5e-4),
+            final_lr=self.experiment_config.get("final_lr", 1e-6),
+            use_bias=self.experiment_config.get("use_bias", True),
             num_envs=self.num_envs,
             eval_freq=self.eval_freq,
         )
@@ -459,6 +492,190 @@ class ContinualTrainer:
         return self.results
 
 
+def create_ppo_for_game_with_config(
+    game_name: str,
+    experiment_config: Dict,
+    steps_per_game: int,
+    num_envs: int,
+) -> PPO:
+    """Create PPO instance for a game with the given experiment config."""
+    env, env_params = create_padded_env(game_name)
+    config = create_ppo_config(
+        env=env,
+        env_params=env_params,
+        config_name=experiment_config["name"],
+        total_timesteps=steps_per_game,
+        ortho_mode=experiment_config.get("ortho_mode"),
+        ortho_coeff=experiment_config.get("ortho_coeff", 0.1),
+        activation=experiment_config.get("activation", "tanh"),
+        lr_schedule=experiment_config.get("lr_schedule", "constant"),
+        learning_rate=experiment_config.get("learning_rate", 2.5e-4),
+        final_lr=experiment_config.get("final_lr", 1e-6),
+        use_bias=experiment_config.get("use_bias", True),
+        num_envs=num_envs,
+        eval_freq=steps_per_game,  # Eval only at end for parallel mode
+    )
+    return PPO.create(**config)
+
+
+def run_experiment_parallel(
+    experiment_config: Dict,
+    steps_per_game: int,
+    num_cycles: int,
+    num_seeds: int,
+    num_envs: int,
+    seed: int = 0,
+):
+    """
+    Run experiment with all seeds in parallel using vmap.
+
+    This is much faster than sequential seed execution but doesn't support
+    wandb logging or checkpointing during training.
+    """
+    config_name = experiment_config["name"]
+    print(f"\n{'#'*70}")
+    print(f"# Experiment (PARALLEL): {config_name}")
+    print(f"# Seeds: {num_seeds}, Steps per game: {steps_per_game:,}, Cycles: {num_cycles}")
+    print(f"{'#'*70}")
+
+    # Create PPO instances for all games (same config, different envs)
+    ppos = [create_ppo_for_game_with_config(game, experiment_config, steps_per_game, num_envs)
+            for game in GAME_ORDER]
+
+    # Create vmapped train functions for each game
+    vmap_trains = [jax.jit(jax.vmap(PPO.train, in_axes=(None, 0))) for _ in ppos]
+
+    # Generate seeds
+    rngs = jax.random.split(jax.random.PRNGKey(seed), num_seeds)
+
+    # Results storage: (num_cycles, num_games, num_seeds)
+    all_returns = []
+
+    print(f"\nCompiling training functions...")
+    compile_start = time.time()
+
+    # Compile by running first game
+    first_train_states, _ = vmap_trains[0](ppos[0], rngs)
+    jax.block_until_ready(first_train_states)
+    print(f"  Compiled in {time.time() - compile_start:.1f}s")
+
+    for cycle_idx in range(num_cycles):
+        print(f"\n{'='*60}")
+        print(f"Cycle {cycle_idx + 1}/{num_cycles}")
+        print(f"{'='*60}")
+
+        cycle_returns = []
+
+        for game_idx, game_name in enumerate(GAME_ORDER):
+            print(f"\n  Training on {game_name}...")
+            start_time = time.time()
+
+            ppo = ppos[game_idx]
+            vmap_train = vmap_trains[game_idx]
+
+            if cycle_idx == 0 and game_idx == 0:
+                # Use already-computed first game results
+                train_states = first_train_states
+                # Re-evaluate to get returns
+                eval_rngs = jax.random.split(jax.random.PRNGKey(seed + 1000), num_seeds)
+
+                @jax.jit
+                def vmap_eval(ppo, ts, rngs):
+                    def eval_single(ts, rng):
+                        return ppo.eval_callback(ppo, ts, rng)
+                    return jax.vmap(eval_single)(ts, rngs)
+
+                _, returns = vmap_eval(ppo, train_states, eval_rngs)
+            else:
+                # Transfer weights from previous game to this game's PPO
+                if game_idx > 0 or cycle_idx > 0:
+                    # Initialize fresh train states for this game
+                    init_rngs = jax.random.split(jax.random.PRNGKey(seed + cycle_idx * 100 + game_idx), num_seeds)
+
+                    @jax.jit
+                    def vmap_init(ppo, rngs):
+                        return jax.vmap(ppo.init_state)(rngs)
+
+                    new_train_states = vmap_init(ppo, init_rngs)
+
+                    # Transfer network weights from previous train_states
+                    # Note: train_states has shape (num_seeds, ...) from vmap
+                    new_train_states = new_train_states.replace(
+                        actor_ts=new_train_states.actor_ts.replace(
+                            params=train_states.actor_ts.params,
+                            opt_state=train_states.actor_ts.opt_state,
+                        ),
+                        critic_ts=new_train_states.critic_ts.replace(
+                            params=train_states.critic_ts.params,
+                            opt_state=train_states.critic_ts.opt_state,
+                        ),
+                        global_step=train_states.global_step,
+                    )
+
+                    # Continue training from transferred weights
+                    train_rngs = jax.random.split(jax.random.PRNGKey(seed + cycle_idx * 1000 + game_idx * 10), num_seeds)
+
+                    @jax.jit
+                    def vmap_continue_train(ppo, ts, rngs):
+                        def train_single(ts, rng):
+                            # Run training iterations
+                            iteration_steps = ppo.num_envs * ppo.num_steps
+                            num_iterations = int(np.ceil(steps_per_game / iteration_steps))
+                            def body(_, ts):
+                                return ppo.train_iteration(ts)
+                            return jax.lax.fori_loop(0, num_iterations, body, ts)
+                        return jax.vmap(train_single)(ts, rngs)
+
+                    train_states = vmap_continue_train(ppo, new_train_states, train_rngs)
+                else:
+                    # Fresh training for first game of first cycle
+                    train_states, _ = vmap_train(ppo, rngs)
+
+                jax.block_until_ready(train_states)
+
+                # Evaluate
+                eval_rngs = jax.random.split(jax.random.PRNGKey(seed + 2000 + cycle_idx * 100 + game_idx), num_seeds)
+
+                @jax.jit
+                def vmap_eval(ppo, ts, rngs):
+                    def eval_single(ts, rng):
+                        return ppo.eval_callback(ppo, ts, rng)
+                    return jax.vmap(eval_single)(ts, rngs)
+
+                _, returns = vmap_eval(ppo, train_states, eval_rngs)
+
+            # returns shape: (num_seeds, num_eval_episodes)
+            mean_returns = returns.mean(axis=-1)  # (num_seeds,)
+            elapsed = time.time() - start_time
+            steps_per_sec = steps_per_game * num_seeds / elapsed if elapsed > 0 else 0
+
+            print(f"    {game_name}: return={mean_returns.mean():.1f}±{mean_returns.std():.1f} "
+                  f"| {steps_per_sec:,.0f} steps/s")
+
+            cycle_returns.append({
+                "game": game_name,
+                "cycle": cycle_idx,
+                "returns_per_seed": mean_returns.tolist(),
+                "mean_return": float(mean_returns.mean()),
+                "std_return": float(mean_returns.std()),
+            })
+
+        all_returns.append(cycle_returns)
+
+    # Compile final results
+    results = {
+        "config_name": config_name,
+        "experiment_config": experiment_config,
+        "steps_per_game": steps_per_game,
+        "num_cycles": num_cycles,
+        "num_seeds": num_seeds,
+        "games": GAME_ORDER,
+        "results_by_cycle": all_returns,
+    }
+
+    return results
+
+
 def run_experiment(
     experiment_config: Dict,
     steps_per_game: int,
@@ -471,7 +688,7 @@ def run_experiment(
     wandb_project: str,
     seed: int = 0,
 ):
-    """Run a single experiment configuration with multiple seeds."""
+    """Run a single experiment configuration with multiple seeds (sequential)."""
     config_name = experiment_config["name"]
     print(f"\n{'#'*70}")
     print(f"# Experiment: {config_name}")
@@ -593,9 +810,11 @@ def main():
     parser.add_argument("--test-action-mapping", action="store_true",
                         help="Test action mapping and exit")
     parser.add_argument("--configs", nargs="+",
-                        default=["baseline", "ortho_opt", "ortho_opt_linear_lr"],
-                        choices=["baseline", "ortho_opt", "ortho_opt_linear_lr"],
+                        default=["baseline", "ortho_adamo", "ortho_adamo_lyle_lr"],
+                        choices=["baseline", "ortho_adamo", "ortho_adamo_lyle_lr"],
                         help="Experiment configurations to run")
+    parser.add_argument("--parallel-seeds", action="store_true",
+                        help="Run all seeds in parallel using vmap (faster but no wandb/checkpoints)")
 
     args = parser.parse_args()
 
@@ -609,22 +828,71 @@ def main():
     # Filter configs
     configs_to_run = [c for c in EXPERIMENT_CONFIGS if c["name"] in args.configs]
 
-    all_experiment_results = {}
+    all_experiment_results = {c["name"]: [] for c in configs_to_run}
 
-    for experiment_config in configs_to_run:
-        results = run_experiment(
-            experiment_config=experiment_config,
-            steps_per_game=args.steps_per_game,
-            num_cycles=args.num_cycles,
-            num_seeds=args.num_seeds,
-            num_envs=args.num_envs,
-            eval_freq=args.eval_freq,
-            checkpoint_dir=checkpoint_dir,
-            use_wandb=args.use_wandb,
-            wandb_project=args.wandb_project,
-            seed=args.seed,
-        )
-        all_experiment_results[experiment_config["name"]] = results
+    if args.parallel_seeds:
+        # Parallel execution: all seeds at once per config
+        if args.use_wandb:
+            print("Warning: --use-wandb is ignored with --parallel-seeds")
+        for experiment_config in configs_to_run:
+            results = run_experiment_parallel(
+                experiment_config=experiment_config,
+                steps_per_game=args.steps_per_game,
+                num_cycles=args.num_cycles,
+                num_seeds=args.num_seeds,
+                num_envs=args.num_envs,
+                seed=args.seed,
+            )
+            all_experiment_results[experiment_config["name"]] = results
+    else:
+        # Sequential execution: run all configs for each seed before moving to next seed
+        # This allows comparing configs at the same seed more easily
+        for seed_idx in range(args.num_seeds):
+            print(f"\n{'='*70}")
+            print(f"SEED {seed_idx + 1}/{args.num_seeds}")
+            print(f"{'='*70}")
+
+            for experiment_config in configs_to_run:
+                config_name = experiment_config["name"]
+                print(f"\n{'#'*60}")
+                print(f"# Config: {config_name} | Seed: {seed_idx}")
+                print(f"{'#'*60}")
+
+                rng = jax.random.PRNGKey(args.seed + seed_idx)
+
+                if args.use_wandb:
+                    import wandb
+                    run_name = f"{config_name}_seed{seed_idx}"
+                    wandb.init(
+                        project=args.wandb_project,
+                        name=run_name,
+                        config={
+                            "experiment_config": experiment_config,
+                            "steps_per_game": args.steps_per_game,
+                            "num_cycles": args.num_cycles,
+                            "seed": args.seed + seed_idx,
+                        },
+                        reinit=True,
+                    )
+
+                trainer = ContinualTrainer(
+                    config_name=f"{config_name}_seed{seed_idx}",
+                    experiment_config=experiment_config,
+                    steps_per_game=args.steps_per_game,
+                    num_cycles=args.num_cycles,
+                    num_envs=args.num_envs,
+                    eval_freq=args.eval_freq,
+                    checkpoint_dir=checkpoint_dir / config_name,
+                    use_wandb=args.use_wandb,
+                    wandb_project=args.wandb_project,
+                )
+
+                results = trainer.run(rng)
+                all_experiment_results[config_name].append(results)
+
+                if args.use_wandb:
+                    import wandb
+                    wandb.finish()
 
     # Save all results
     save_results(all_experiment_results, output_dir)
