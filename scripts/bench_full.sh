@@ -8,5 +8,4 @@ uv run python scripts/throughput_benchmark.py \
     --num-seeds 5 \
     --num-envs 2048 \
     --eval-freq 500000 \
-    --use-wandb \
-    --output-dir benchmark_results/full
+    --use-wandb

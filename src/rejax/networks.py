@@ -12,6 +12,9 @@ def groupsort(x, group_size=2):
     """
     GroupSort activation function. Splits the input into groups of size `group_size`
     and sorts each group in ascending order.
+
+    For group_size=2, uses fast min/max implementation.
+    For larger groups, falls back to jnp.sort.
     """
     if group_size == 1:
         return x
@@ -23,16 +26,23 @@ def groupsort(x, group_size=2):
             f"Last dimension of input ({shape[-1]}) must be divisible by group_size ({group_size})"
         )
 
-    # Reshape to (..., n_groups, group_size)
+    # Fast path for group_size=2 using min/max (much faster on GPU)
+    if group_size == 2:
+        x = x.reshape(shape[:-1] + (-1, 2))
+        x0, x1 = x[..., 0], x[..., 1]
+        x_min = jnp.minimum(x0, x1)
+        x_max = jnp.maximum(x0, x1)
+        x = jnp.stack([x_min, x_max], axis=-1)
+        return x.reshape(shape)
+
+    # General case: use sort
     x = x.reshape(shape[:-1] + (-1, group_size))
-    # Sort along the last dimension
     x = jnp.sort(x, axis=-1)
-    # Reshape back to original shape
     return x.reshape(shape)
 
 
 def groupsort2(x):
-    """GroupSort with group_size=2 (1-Lipschitz)."""
+    """GroupSort with group_size=2 (1-Lipschitz). Uses fast min/max."""
     return groupsort(x, group_size=2)
 
 

@@ -7,5 +7,4 @@ uv run python scripts/throughput_benchmark.py \
     --timesteps 1000000 \
     --num-seeds 3 \
     --num-envs 2048 \
-    --eval-freq 100000 \
-    --output-dir benchmark_results/smoketest
+    --eval-freq 100000

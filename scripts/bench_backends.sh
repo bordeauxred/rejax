@@ -15,10 +15,8 @@ for backend in mjx spring; do
         --num-seeds 3 \
         --num-envs 2048 \
         --eval-freq 100000 \
-        --brax-backend $backend \
-        --output-dir benchmark_results/backends
+        --brax-backend $backend
     echo ""
 done
 
 echo "=== COMPARISON COMPLETE ==="
-echo "Results saved to benchmark_results/backends/"

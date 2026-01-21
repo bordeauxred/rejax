@@ -55,7 +55,12 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
                      ortho_lambda=0.2, ortho_coeff=1e-3, activation="tanh"):
     """Benchmark a single configuration and return steps/second + per-seed data."""
     depth = len(hidden_layers)
-    run_id = f"{env_name.replace('/', '_')}_d{depth}"
+    width = hidden_layers[0]
+
+    # Create meaningful run_id: env_act_d{depth}_w{width}_ortho-{mode}
+    env_short = env_name.replace('/', '_').replace('-MinAtar', '')
+    ortho_str = f"_ortho-{ortho_mode}" if ortho_mode and ortho_mode != "none" else ""
+    run_id = f"{env_short}_{activation}_d{depth}_w{width}{ortho_str}"
 
     # PureJAXRL-style config for max throughput
     config = {
@@ -91,7 +96,7 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
 
     ppo = PPO.create(**config)
 
-    # Add progress callback
+    # Add progress callback for both compile and benchmark runs
     if eval_freq and eval_freq > 0:
         progress_callback = make_progress_callback(ppo, run_id, total_timesteps)
         ppo = ppo.replace(eval_callback=progress_callback)
@@ -100,15 +105,17 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
     vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
 
     backend_str = f" [{brax_backend}]" if brax_backend and env_name.startswith("brax/") else ""
-    print(f"  Compiling depth={depth} ({hidden_layers[0]}x{depth}){backend_str}...", end=" ", flush=True)
+    ortho_print = f" ortho={ortho_mode}" if ortho_mode and ortho_mode != "none" else ""
+    print(f"  Compiling {run_id}{backend_str}{ortho_print}...")
 
     start = time.time()
-    ts, eval_results = vmap_train(ppo, keys)
+    ts, _ = vmap_train(ppo, keys)
     jax.block_until_ready(ts)
     compile_time = time.time() - start
-    print(f"compiled in {compile_time:.1f}s")
+    print(f"  compiled in {compile_time:.1f}s")
 
     # Benchmark run
+    print(f"  Running benchmark...")
     start = time.time()
     ts, eval_results = vmap_train(ppo, keys)
     jax.block_until_ready(ts)
@@ -146,10 +153,13 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
     steps_per_sec = total_steps / runtime
 
     result = {
+        "run_id": run_id,
         "env": env_name,
         "depth": depth,
-        "width": hidden_layers[0],
+        "width": width,
         "hidden_layers": str(hidden_layers),
+        "activation": activation,
+        "ortho_mode": ortho_mode,
         "num_envs": num_envs,
         "num_seeds": num_seeds,
         "total_timesteps": total_timesteps,
@@ -163,6 +173,9 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
 
     if brax_backend and env_name.startswith("brax/"):
         result["brax_backend"] = brax_backend
+    if ortho_mode and ortho_mode != "none":
+        result["ortho_lambda"] = ortho_lambda
+        result["ortho_coeff"] = ortho_coeff
 
     if per_seed_data:
         result["final_return_mean"] = np.mean(per_seed_data["final_returns_per_seed"])
@@ -173,9 +186,8 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
 
 def log_to_wandb(result, wandb):
     """Log per-seed training curves to wandb."""
-    env = result["env"].replace("/", "_")
-    depth = result["depth"]
-    prefix = f"{env}/d{depth}"
+    # Use run_id as prefix for clear identification
+    prefix = result.get("run_id", f"{result['env'].replace('/', '_')}_d{result['depth']}")
 
     # Log summary stats
     wandb.log({
@@ -253,11 +265,18 @@ def main():
                         help="Ortho coefficient for optimizer mode")
     parser.add_argument("--activation", type=str, default="tanh",
                         help="Activation function (tanh, relu, swish, groupsort, groupsort4, etc.)")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="WandB run name (auto-generated if not set)")
     args = parser.parse_args()
+
+    # Generate run name if not provided
+    if args.run_name is None:
+        ortho_str = f"_{args.ortho_mode}" if args.ortho_mode != "none" else ""
+        args.run_name = f"ppo_{args.activation}{ortho_str}_d{'-'.join(map(str, args.depths))}"
 
     if args.use_wandb:
         import wandb
-        wandb.init(project="rejax-throughput", config=vars(args))
+        wandb.init(project="rejax-throughput", name=args.run_name, config=vars(args))
 
     results = []
     for env in args.envs:
