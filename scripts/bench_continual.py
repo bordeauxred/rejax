@@ -35,18 +35,19 @@ from gymnax.environments.minatar.breakout import MinBreakout
 from gymnax.environments.minatar.asterix import MinAsterix
 from gymnax.environments.minatar.space_invaders import MinSpaceInvaders
 from gymnax.environments.minatar.freeway import MinFreeway
+from minatar_seaquest_fixed import MinSeaquestFixed
 
 from rejax import PPO
 
 
 # MinAtar game configurations
-# Note: Seaquest excluded - gymnax implementation is an incomplete stub with dict-style
-# access on dataclasses and non-functional step functions (step_divers, step_e_subs, etc.)
+# Note: Seaquest uses fixed implementation adapted from pgx-minatar (gymnax version is broken)
 MINATAR_GAMES = {
     "Breakout-MinAtar": {"channels": 4, "actions": 3, "env_cls": MinBreakout},
     "Asterix-MinAtar": {"channels": 4, "actions": 5, "env_cls": MinAsterix},
     "SpaceInvaders-MinAtar": {"channels": 6, "actions": 4, "env_cls": MinSpaceInvaders},
     "Freeway-MinAtar": {"channels": 7, "actions": 3, "env_cls": MinFreeway},
+    "Seaquest-MinAtar": {"channels": 10, "actions": 6, "env_cls": MinSeaquestFixed},
 }
 
 GAME_ORDER = [
@@ -54,12 +55,13 @@ GAME_ORDER = [
     "Asterix-MinAtar",
     "SpaceInvaders-MinAtar",
     "Freeway-MinAtar",
+    "Seaquest-MinAtar",
 ]
 
-# Unified observation space: 7 channels (max from Freeway)
-UNIFIED_CHANNELS = 7
-# Unified action space: 5 actions (max from Asterix)
-UNIFIED_ACTIONS = 5
+# Unified observation space: 10 channels (max from Seaquest)
+UNIFIED_CHANNELS = 10
+# Unified action space: 6 actions (max from Seaquest)
+UNIFIED_ACTIONS = 6
 
 
 class PaddedMinAtarEnv:
