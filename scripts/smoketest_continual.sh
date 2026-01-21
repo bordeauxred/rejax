@@ -4,26 +4,14 @@
 
 set -e
 
-# Get the directory of this script and set up paths
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
-
-# Add src to PYTHONPATH
-export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH}"
-
-# Change to repo directory
-cd "$REPO_DIR"
-
 echo "=============================================="
 echo "Continual Learning Benchmark - Smoke Test"
 echo "=============================================="
-echo "Working directory: $(pwd)"
-echo "PYTHONPATH includes: ${REPO_DIR}/src"
 
 # Test 1: Network use_bias verification
 echo ""
 echo "Test 1: Verifying network use_bias parameter..."
-python -c "
+uv run python -c "
 import jax
 import jax.numpy as jnp
 from rejax.networks import MLP, VNetwork, DiscretePolicy, DiscreteQNetwork
@@ -63,7 +51,7 @@ echo "  - All 3 configs: baseline, ortho_adamo, ortho_adamo_lyle_lr"
 echo "  - With wandb logging"
 echo ""
 
-python scripts/bench_continual.py \
+uv run python scripts/bench_continual.py \
     --steps-per-game 100000 \
     --num-cycles 1 \
     --num-seeds 2 \
