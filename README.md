@@ -148,6 +148,8 @@ Single file implementations:
 ##Setup
 
 curl -LsSf https://astral.sh/uv/install.sh | sh
+cd rejax
+uv sync
 uv pip install "jax[cuda12]"
 uv pip install brax mujoco                                                     
 uv run wandb login
