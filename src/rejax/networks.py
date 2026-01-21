@@ -92,12 +92,13 @@ def parse_activation_fn(name: str):
 class MLP(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
+    use_bias: bool = True
 
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
         for size in self.hidden_layer_sizes:
-            x = nn.Dense(size)(x)
+            x = nn.Dense(size, use_bias=self.use_bias)(x)
             x = self.activation(x)
         return x
 
@@ -109,10 +110,11 @@ class DiscretePolicy(nn.Module):
     action_dim: int
     hidden_layer_sizes: Sequence[int]
     activation: Callable
+    use_bias: bool = True
 
     def setup(self):
-        self.features = MLP(self.hidden_layer_sizes, self.activation)
-        self.action_logits = nn.Dense(self.action_dim)
+        self.features = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)
+        self.action_logits = nn.Dense(self.action_dim, use_bias=self.use_bias)
 
     def _action_dist(self, obs):
         features = self.features(obs)
@@ -157,10 +159,11 @@ class GaussianPolicy(nn.Module):
     action_range: tuple[int, int]
     hidden_layer_sizes: Sequence[int]
     activation: Callable
+    use_bias: bool = True
 
     def setup(self):
-        self.features = MLP(self.hidden_layer_sizes, self.activation)
-        self.action_mean = nn.Dense(self.action_dim)
+        self.features = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)
+        self.action_mean = nn.Dense(self.action_dim, use_bias=self.use_bias)
         self.action_log_std = self.param(
             "action_log_std", constant(0.0), (self.action_dim,)
         )
@@ -197,11 +200,12 @@ class SquashedGaussianPolicy(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
     log_std_range: tuple[float, float]
+    use_bias: bool = True
 
     def setup(self):
-        self.features = MLP(self.hidden_layer_sizes, self.activation)
-        self.action_mean = nn.Dense(self.action_dim)
-        self.action_log_std = nn.Dense(self.action_dim)
+        self.features = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)
+        self.action_mean = nn.Dense(self.action_dim, use_bias=self.use_bias)
+        self.action_log_std = nn.Dense(self.action_dim, use_bias=self.use_bias)
         self.bij = distrax.Tanh()
 
     @property
@@ -261,6 +265,7 @@ class BetaPolicy(nn.Module):
     action_range: tuple[float, float]
     hidden_layer_sizes: Sequence[int]
     activation: Callable
+    use_bias: bool = True
 
     @property
     def action_loc(self):
@@ -275,9 +280,9 @@ class BetaPolicy(nn.Module):
         return action, *self.log_prob_entropy(obs, action)
 
     def setup(self):
-        self.features = MLP(self.hidden_layer_sizes, self.activation)
-        self.alpha = nn.Dense(self.action_dim)
-        self.beta = nn.Dense(self.action_dim)
+        self.features = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)
+        self.alpha = nn.Dense(self.action_dim, use_bias=self.use_bias)
+        self.beta = nn.Dense(self.action_dim, use_bias=self.use_bias)
 
     def _action_dist(self, obs):
         x = self.features(obs)
@@ -307,6 +312,7 @@ class DeterministicPolicy(nn.Module):
     action_range: tuple[float, float]
     hidden_layer_sizes: tuple[int]
     activation: Callable
+    use_bias: bool = True
 
     @property
     def action_loc(self):
@@ -319,9 +325,9 @@ class DeterministicPolicy(nn.Module):
     @nn.compact
     def __call__(self, x):
         for size in self.hidden_layer_sizes:
-            x = nn.Dense(size)(x)
+            x = nn.Dense(size, use_bias=self.use_bias)(x)
             x = self.activation(x)
-        x = nn.Dense(self.action_dim)(x)
+        x = nn.Dense(self.action_dim, use_bias=self.use_bias)(x)
         x = jnp.tanh(x)
 
         action = self.action_loc + x * self.action_scale
@@ -339,7 +345,7 @@ class VNetwork(MLP):
     @nn.compact
     def __call__(self, obs):
         x = super().__call__(obs)
-        return nn.Dense(1)(x).squeeze(1)
+        return nn.Dense(1, use_bias=self.use_bias)(x).squeeze(1)
 
 
 class QNetwork(MLP):
@@ -347,16 +353,18 @@ class QNetwork(MLP):
     def __call__(self, obs, action):
         x = jnp.concatenate([obs.reshape(obs.shape[0], -1), action], axis=-1)
         x = super().__call__(x)
-        return nn.Dense(1)(x).squeeze(1)
+        return nn.Dense(1, use_bias=self.use_bias)(x).squeeze(1)
 
 
 class DiscreteQNetwork(MLP):
-    action_dim: int
+    # Note: action_dim must have default due to dataclass inheritance rules
+    # (parent MLP has use_bias with default)
+    action_dim: int = 0
 
     @nn.compact
     def __call__(self, obs):
         x = super().__call__(obs)
-        return nn.Dense(self.action_dim)(x)
+        return nn.Dense(self.action_dim, use_bias=self.use_bias)(x)
 
     def take(self, obs, action):
         q_values = self(obs)
@@ -367,12 +375,13 @@ class DuelingQNetwork(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
     action_dim: int
+    use_bias: bool = True
 
     @nn.compact
     def __call__(self, obs):
-        x = MLP(self.hidden_layer_sizes, self.activation)(obs)
-        value = nn.Dense(1)(x)
-        advantage = nn.Dense(self.action_dim)(x)
+        x = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)(obs)
+        value = nn.Dense(1, use_bias=self.use_bias)(x)
+        advantage = nn.Dense(self.action_dim, use_bias=self.use_bias)(x)
         advantage = advantage - jnp.mean(advantage, axis=-1, keepdims=True)
         return value + advantage
 
@@ -385,6 +394,7 @@ class ImplicitQuantileNetwork(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
     action_dim: int
+    use_bias: bool = True
 
     risk_distortion: Callable = lambda tau: tau
     # risk_distortion: Callable = lambda tau: 0.8 * tau
@@ -397,15 +407,15 @@ class ImplicitQuantileNetwork(nn.Module):
     @nn.compact
     def __call__(self, obs, rng):
         x = obs.reshape(obs.shape[0], -1)
-        psi = MLP(self.hidden_layer_sizes, self.activation)(x)
+        psi = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)(x)
 
         tau = distrax.Uniform(0, 1).sample(seed=rng, sample_shape=obs.shape[0])
         tau = self.risk_distortion(tau)
         phi_input = jnp.cos(jnp.pi * jnp.outer(tau, jnp.arange(self.embedding_dim)))
-        phi = nn.relu(nn.Dense(self.embedding_dim)(phi_input))
+        phi = nn.relu(nn.Dense(self.embedding_dim, use_bias=self.use_bias)(phi_input))
 
-        x = nn.swish(nn.Dense(64)(psi * phi))
-        return nn.Dense(self.action_dim)(x), tau
+        x = nn.swish(nn.Dense(64, use_bias=self.use_bias)(psi * phi))
+        return nn.Dense(self.action_dim, use_bias=self.use_bias)(x), tau
 
     def q(self, obs, rng, num_samples=32):
         rng = jax.random.split(rng, num_samples)
