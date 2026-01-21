@@ -57,10 +57,15 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
     depth = len(hidden_layers)
     width = hidden_layers[0]
 
-    # Descriptive run_id: env_act_d{depth}_ortho-{mode}
+    # Descriptive run_id: env_act_d{depth}_mode{coeff}
     env_short = env_name.replace('-MinAtar', '').replace('/', '_')
     act_short = activation[:4] if activation != "groupsort" else "gsort"
-    ortho_str = f"_{ortho_mode}" if ortho_mode and ortho_mode != "none" else ""
+    if ortho_mode == "optimizer":
+        ortho_str = f"_opt{ortho_coeff}"
+    elif ortho_mode == "loss":
+        ortho_str = f"_loss{ortho_lambda}"
+    else:
+        ortho_str = ""
     run_id = f"{env_short}_{act_short}_d{depth}{ortho_str}"
 
     # PureJAXRL-style config for max throughput
@@ -272,7 +277,12 @@ def main():
 
     # Generate run name if not provided
     if args.run_name is None:
-        ortho_str = f"_{args.ortho_mode}" if args.ortho_mode != "none" else ""
+        if args.ortho_mode == "optimizer":
+            ortho_str = f"_opt{args.ortho_coeff}"
+        elif args.ortho_mode == "loss":
+            ortho_str = f"_loss{args.ortho_lambda}"
+        else:
+            ortho_str = ""
         args.run_name = f"ppo_{args.activation}{ortho_str}_d{'-'.join(map(str, args.depths))}"
 
     if args.use_wandb:
