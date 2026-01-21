@@ -249,13 +249,8 @@ class TD3(
              if step % 1000 == 0:
                  print(f"Step {step}: Critic Loss={log_data.get('critic/loss', 0.0):.4f}, Actor Loss={log_data.get('actor/loss', 0.0):.4f}")
 
-        # Import wandb safely?
-        # Ideally we pass a callback function.
-        # But for now, we assume `wandb` is globally available or use `host_callback`.
-        # `rejax` puts the callback on the algo object. 
-        
-        import wandb
-        
+        # Log metrics via io_callback (frequency controlled by logger's wandb_log_freq for WandB,
+        # TensorBoard always logs for dense training dynamics analysis)
         jax.experimental.io_callback(
             log_metrics,
             (),
