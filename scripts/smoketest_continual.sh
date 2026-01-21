@@ -4,9 +4,21 @@
 
 set -e
 
+# Get the directory of this script and set up paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Add src to PYTHONPATH
+export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH}"
+
+# Change to repo directory
+cd "$REPO_DIR"
+
 echo "=============================================="
 echo "Continual Learning Benchmark - Smoke Test"
 echo "=============================================="
+echo "Working directory: $(pwd)"
+echo "PYTHONPATH includes: ${REPO_DIR}/src"
 
 # Test 1: Network use_bias verification
 echo ""
