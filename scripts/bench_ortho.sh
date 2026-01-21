@@ -7,27 +7,6 @@ set -e
 echo "=============================================="
 echo "Ortho Regularization Throughput Benchmark"
 echo "=============================================="
-
-echo ""
-echo "=== No Ortho (baseline) ==="
-uv run python scripts/throughput_benchmark.py \
-    --envs Breakout-MinAtar \
-    --depths 4 8 \
-    --timesteps 1000000 \
-    --ortho-mode none \
-    --activation tanh
-
-echo ""
-echo "=== Ortho Loss Mode (tanh) ==="
-uv run python scripts/throughput_benchmark.py \
-    --envs Breakout-MinAtar \
-    --depths 4 8 \
-    --timesteps 1000000 \
-    --ortho-mode loss \
-    --ortho-lambda 0.2 \
-    --activation tanh
-
-echo ""
 echo "=== Ortho Loss Mode (groupsort) ==="
 uv run python scripts/throughput_benchmark.py \
     --envs Breakout-MinAtar \
@@ -58,6 +37,30 @@ uv run python scripts/throughput_benchmark.py \
     --activation groupsort
 
 echo ""
+
+
+echo ""
+echo "=== No Ortho (baseline) ==="
+uv run python scripts/throughput_benchmark.py \
+    --envs Breakout-MinAtar \
+    --depths 4 8 \
+    --timesteps 1000000 \
+    --ortho-mode none \
+    --activation tanh
+
+echo ""
+echo "=== Ortho Loss Mode (tanh) ==="
+uv run python scripts/throughput_benchmark.py \
+    --envs Breakout-MinAtar \
+    --depths 4 8 \
+    --timesteps 1000000 \
+    --ortho-mode loss \
+    --ortho-lambda 0.2 \
+    --activation tanh
+
+echo ""
+
+
 echo "=============================================="
 echo "Benchmark Complete"
 echo "=============================================="
