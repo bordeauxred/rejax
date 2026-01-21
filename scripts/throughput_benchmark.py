@@ -89,7 +89,8 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
     # Compile
     vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
 
-    print(f"  Compiling depth={depth} ({hidden_layers[0]}x{depth})...", end=" ", flush=True)
+    backend_str = f" [{brax_backend}]" if brax_backend and env_name.startswith("brax/") else ""
+    print(f"  Compiling depth={depth} ({hidden_layers[0]}x{depth}){backend_str}...", end=" ", flush=True)
     start = time.time()
     ts, _ = vmap_train(ppo, keys)
     jax.block_until_ready(ts)
@@ -99,16 +100,21 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
     # Benchmark (3 runs, or 1 if logging progress)
     num_runs = 1 if (eval_freq and eval_freq > 0) else 3
     times = []
+    final_returns = None
     for i in range(num_runs):
         if num_runs > 1:
             print(f"    Run {i+1}/{num_runs}...", end=" ", flush=True)
         start = time.time()
-        ts, _ = vmap_train(ppo, keys)
+        ts, eval_results = vmap_train(ppo, keys)
         jax.block_until_ready(ts)
         elapsed = time.time() - start
         times.append(elapsed)
         if num_runs > 1:
             print(f"{elapsed:.1f}s")
+        # Capture final returns (eval_results is (lengths, returns) from last eval)
+        if eval_results is not None and len(eval_results) == 2:
+            _, returns = eval_results
+            final_returns = float(returns.mean())
 
     avg_time = sum(times) / len(times)
     total_steps = total_timesteps * num_seeds
@@ -126,6 +132,7 @@ def benchmark_config(env_name, hidden_layers, num_envs, num_seeds, total_timeste
         "avg_runtime_s": avg_time,
         "steps_per_second": steps_per_sec,
         "steps_per_second_per_seed": steps_per_sec / num_seeds,
+        "final_return": final_returns,
     }
     if brax_backend and env_name.startswith("brax/"):
         result["brax_backend"] = brax_backend
@@ -187,13 +194,14 @@ def main():
                 traceback.print_exc()
 
     # Summary table
-    print("\n" + "="*80)
-    print(f"{'Env':<20} {'Depth':>6} {'Width':>6} {'Steps/sec':>12} {'Per seed':>12} {'Compile':>10}")
-    print("="*80)
+    print("\n" + "="*90)
+    print(f"{'Env':<20} {'Depth':>6} {'Width':>6} {'Steps/sec':>12} {'Per seed':>12} {'Return':>10} {'Compile':>10}")
+    print("="*90)
     for r in results:
+        ret_str = f"{r['final_return']:.1f}" if r.get('final_return') is not None else "N/A"
         print(f"{r['env']:<20} {r['depth']:>6} {r['width']:>6} "
               f"{r['steps_per_second']:>12,.0f} {r['steps_per_second_per_seed']:>12,.0f} "
-              f"{r['compile_time_s']:>10.1f}s")
+              f"{ret_str:>10} {r['compile_time_s']:>10.1f}s")
 
     if args.use_wandb:
         import wandb
