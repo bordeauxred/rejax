@@ -31,6 +31,54 @@ def groupsort(x, group_size=2):
     return x.reshape(shape)
 
 
+def groupsort2(x):
+    """GroupSort with group_size=2 (1-Lipschitz)."""
+    return groupsort(x, group_size=2)
+
+
+def groupsort4(x):
+    """GroupSort with group_size=4."""
+    return groupsort(x, group_size=4)
+
+
+def groupsort8(x):
+    """GroupSort with group_size=8."""
+    return groupsort(x, group_size=8)
+
+
+def parse_activation_fn(name: str):
+    """
+    Parse an activation function name string into a callable.
+
+    Supports:
+    - Standard Flax activations: 'relu', 'tanh', 'swish', 'gelu', 'silu', etc.
+    - GroupSort variants: 'groupsort', 'groupsort2', 'groupsort4', 'groupsort8'
+
+    Args:
+        name: Name of the activation function
+
+    Returns:
+        Callable activation function
+    """
+    name_lower = name.lower()
+
+    # GroupSort variants
+    if name_lower == "groupsort" or name_lower == "groupsort2":
+        return groupsort2
+    elif name_lower == "groupsort4":
+        return groupsort4
+    elif name_lower == "groupsort8":
+        return groupsort8
+
+    # Standard Flax activations
+    if hasattr(nn, name_lower):
+        return getattr(nn, name_lower)
+    if hasattr(nn, name):
+        return getattr(nn, name)
+
+    raise ValueError(f"Unknown activation function: {name}")
+
+
 class MLP(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
