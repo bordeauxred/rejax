@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import gymnax
 import jax
@@ -158,16 +158,35 @@ def create_ppo_config(
     use_bias: bool = True,
     num_envs: int = 2048,
     eval_freq: int = 500_000,
+    network_type: str = "mlp",
+    hidden_layer_sizes: Tuple[int, ...] = (256, 256, 256, 256),
 ) -> Dict:
     """Create PPO configuration dict."""
+    if network_type == "cnn":
+        # CNN architecture (pgx MinAtar style)
+        agent_kwargs = {
+            "network_type": "cnn",
+            "conv_channels": (32,),
+            "mlp_hidden_sizes": (64, 64, 64),
+            "kernel_size": 2,
+            "use_avgpool": True,
+            "pool_size": 2,
+            "activation": activation,
+            "use_bias": use_bias,
+        }
+    else:
+        # MLP architecture (configurable, default: 4x256 per Lyle et al.)
+        agent_kwargs = {
+            "network_type": "mlp",
+            "hidden_layer_sizes": hidden_layer_sizes,
+            "activation": activation,
+            "use_bias": use_bias,
+        }
+
     config = {
         "env": env,
         "env_params": env_params,
-        "agent_kwargs": {
-            "hidden_layer_sizes": (256, 256, 256, 256),  # 4 layers per Lyle et al.
-            "activation": activation,
-            "use_bias": use_bias,
-        },
+        "agent_kwargs": agent_kwargs,
         "num_envs": num_envs,
         "num_steps": 128,
         "num_epochs": 4,
@@ -192,9 +211,95 @@ def create_ppo_config(
 
 
 # Experiment configurations
-EXPERIMENT_CONFIGS = [
+#
+# Architecture notes:
+# - MLP: 4x256 layers (Lyle et al.) - deeper networks show more plasticity loss
+# - CNN: pgx MinAtar style (conv32-k2 + avgpool + mlp64x3) - standard for MinAtar
+#
+# Activation notes:
+# - GroupSort: Only for MLP layers, designed for FC networks (1-Lipschitz)
+# - ReLU: Standard for CNNs, groupsort doesn't work well with conv layers
+#
+# MLP configs (Lyle et al. style with 4x256 layers for plasticity research)
+EXPERIMENT_CONFIGS_MLP = [
+    {
+        "name": "mlp_baseline",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),  # 4 layers per Lyle et al.
+        "ortho_mode": None,
+        "activation": "tanh",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "use_bias": True,
+    },
+    {
+        "name": "mlp_adamo",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "groupsort",  # 1-Lipschitz activation for ortho networks
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "use_bias": False,  # Disable bias for ortho experiments
+    },
+    {
+        "name": "mlp_adamo_lyle_lr",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "groupsort",
+        "lr_schedule": "linear",
+        "learning_rate": 6.25e-5,   # Lyle et al. initial LR
+        "final_lr": 1e-6,           # Lyle et al. final LR
+        "use_bias": False,
+    },
+]
+
+# CNN configs (pgx MinAtar style)
+# Note: AdaMO with CNN uses ReLU throughout - groupsort not compatible with conv layers
+EXPERIMENT_CONFIGS_CNN = [
+    {
+        "name": "cnn_baseline",
+        "network_type": "cnn",
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 3e-4,  # pgx default
+        "use_bias": True,
+    },
+    {
+        "name": "cnn_adamo",
+        "network_type": "cnn",
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "relu",  # ReLU for CNN (groupsort incompatible with conv)
+        "lr_schedule": "constant",
+        "learning_rate": 3e-4,
+        "use_bias": False,
+    },
+    {
+        "name": "cnn_adamo_lyle_lr",
+        "network_type": "cnn",
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "relu",
+        "lr_schedule": "linear",
+        "learning_rate": 6.25e-5,
+        "final_lr": 1e-6,
+        "use_bias": False,
+    },
+]
+
+# Combined for backward compatibility
+EXPERIMENT_CONFIGS = EXPERIMENT_CONFIGS_MLP + EXPERIMENT_CONFIGS_CNN
+
+# Legacy aliases
+EXPERIMENT_CONFIGS_LEGACY = [
     {
         "name": "baseline",
+        "network_type": "mlp",
         "ortho_mode": None,
         "activation": "tanh",
         "lr_schedule": "constant",
@@ -203,22 +308,24 @@ EXPERIMENT_CONFIGS = [
     },
     {
         "name": "ortho_adamo",
+        "network_type": "mlp",
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "groupsort",
         "lr_schedule": "constant",
         "learning_rate": 2.5e-4,
-        "use_bias": False,  # Disable bias for ortho experiments
+        "use_bias": False,
     },
     {
         "name": "ortho_adamo_lyle_lr",
+        "network_type": "mlp",
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "groupsort",
         "lr_schedule": "linear",
-        "learning_rate": 6.25e-5,   # Lyle et al. initial LR
-        "final_lr": 1e-6,           # Lyle et al. final LR
-        "use_bias": False,  # Disable bias for ortho experiments
+        "learning_rate": 6.25e-5,
+        "final_lr": 1e-6,
+        "use_bias": False,
     },
 ]
 
@@ -304,6 +411,8 @@ class ContinualTrainer:
             use_bias=self.experiment_config.get("use_bias", True),
             num_envs=self.num_envs,
             eval_freq=self.eval_freq,
+            network_type=self.experiment_config.get("network_type", "mlp"),
+            hidden_layer_sizes=self.experiment_config.get("hidden_layer_sizes", (256, 256, 256, 256)),
         )
         return PPO.create(**config)
 
@@ -521,6 +630,8 @@ def create_ppo_for_game_with_config(
         use_bias=experiment_config.get("use_bias", True),
         num_envs=num_envs,
         eval_freq=steps_per_game,  # Eval only at end for parallel mode
+        network_type=experiment_config.get("network_type", "mlp"),
+        hidden_layer_sizes=experiment_config.get("hidden_layer_sizes", (256, 256, 256, 256)),
     )
     return PPO.create(**config)
 
@@ -816,9 +927,11 @@ def main():
                         help="Path to checkpoint for resuming")
     parser.add_argument("--test-action-mapping", action="store_true",
                         help="Test action mapping and exit")
+    # Get all config names
+    all_config_names = [c["name"] for c in EXPERIMENT_CONFIGS] + [c["name"] for c in EXPERIMENT_CONFIGS_LEGACY]
     parser.add_argument("--configs", nargs="+",
-                        default=["baseline", "ortho_adamo", "ortho_adamo_lyle_lr"],
-                        choices=["baseline", "ortho_adamo", "ortho_adamo_lyle_lr"],
+                        default=["mlp_baseline", "cnn_baseline"],
+                        choices=all_config_names,
                         help="Experiment configurations to run")
     parser.add_argument("--parallel-seeds", action="store_true",
                         help="Run all seeds in parallel using vmap (faster but no wandb/checkpoints)")
@@ -832,8 +945,9 @@ def main():
     checkpoint_dir = Path(args.checkpoint_dir)
     output_dir = Path(args.output_dir)
 
-    # Filter configs
-    configs_to_run = [c for c in EXPERIMENT_CONFIGS if c["name"] in args.configs]
+    # Filter configs (check both new and legacy lists)
+    all_configs = EXPERIMENT_CONFIGS + EXPERIMENT_CONFIGS_LEGACY
+    configs_to_run = [c for c in all_configs if c["name"] in args.configs]
 
     all_experiment_results = {c["name"]: [] for c in configs_to_run}
 

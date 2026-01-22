@@ -82,35 +82,60 @@ def create_strong_ppo_config(
     env_params,
     total_timesteps: int,
     eval_freq: int = 100_000,
-    num_envs: int = 2048,
+    num_envs: int = 4096,
+    network_type: str = "cnn",
 ) -> Dict:
     """
-    Create PPO config matching PureJaxRL's strong baseline.
+    Create PPO config matching pgx MinAtar PPO baseline.
 
-    Key differences from default rejax:
-    - anneal_lr=True: Linear LR decay to 0
-    - use_orthogonal_init=True: Orthogonal weight initialization
-    - adam eps=1e-5 (handled in PPO now)
-    - clip_by_global_norm (handled in PPO now)
+    Key features:
+    - network_type: "cnn" (default for MinAtar) or "mlp" (for comparison)
+    - adam eps=1e-5 (handled in PPO)
+    - clip_by_global_norm (handled in PPO)
+
+    CNN architecture (pgx MinAtar PPO):
+    - Conv: (32,), kernel 2x2, avgpool 2x2
+    - MLP: (64, 64, 64)
+    - Activation: ReLU
+
+    Reference: https://github.com/sotetsuk/pgx/blob/main/examples/minatar-ppo/train.py
+    Expected scores at 20M steps: Asterix ~25, Breakout ~50, Freeway ~60, Seaquest ~60, SpaceInvaders ~150
     """
+    if network_type == "cnn":
+        # CNN for image observations (pgx MinAtar PPO style)
+        agent_kwargs = {
+            "network_type": "cnn",
+            "conv_channels": (32,),
+            "mlp_hidden_sizes": (64, 64, 64),
+            "kernel_size": 2,
+            "use_avgpool": True,
+            "pool_size": 2,
+            "activation": "relu",
+            "use_orthogonal_init": False,  # pgx doesn't use orthogonal init
+        }
+    else:
+        # MLP for comparison (flattened obs)
+        agent_kwargs = {
+            "network_type": "mlp",
+            "hidden_layer_sizes": (64, 64),
+            "activation": "tanh",
+            "use_orthogonal_init": True,
+        }
+
     return {
         "env": env,
         "env_params": env_params,
-        "agent_kwargs": {
-            "hidden_layer_sizes": (256, 256, 256, 256),  # Lyle et al. / continual setup
-            "activation": "tanh",
-            "use_orthogonal_init": True,  # Critical for strong baseline
-        },
-        # PureJaxRL defaults for MinAtar
+        "agent_kwargs": agent_kwargs,
+        # pgx MinAtar PPO hyperparameters
         "num_envs": num_envs,
         "num_steps": 128,
-        "num_epochs": 4,
-        "num_minibatches": 4,
-        "learning_rate": 2.5e-4,
-        "anneal_lr": True,  # Critical: linear decay to 0
+        "num_epochs": 3,  # pgx uses 3
+        "num_minibatches": 1,  # pgx: minibatch_size=4096, same as num_envs
+        "learning_rate": 3e-4,  # pgx default
+        "anneal_lr": False,  # pgx doesn't anneal
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "clip_eps": 0.1,  # PureJaxRL MinAtar default (not 0.2!)
+        "clip_eps": 0.2,
         "ent_coef": 0.01,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
@@ -206,11 +231,12 @@ def benchmark_single_game(
     use_wandb: bool = False,
     wandb_run = None,
     padded: bool = False,
+    network_type: str = "cnn",
 ) -> GameResult:
     """Benchmark a single game and collect learning curves."""
     mode_str = "PADDED" if padded else "NATIVE"
     print(f"\n{'='*70}")
-    print(f"Game: {game_name} ({mode_str})")
+    print(f"Game: {game_name} ({mode_str}, {network_type.upper()})")
     print(f"{'='*70}")
 
     # Create environment
@@ -223,6 +249,7 @@ def benchmark_single_game(
         total_timesteps=total_timesteps,
         eval_freq=eval_freq,
         num_envs=num_envs,
+        network_type=network_type,
     )
 
     ppo = PPO.create(**config)
@@ -230,8 +257,12 @@ def benchmark_single_game(
     # Print config summary
     print(f"  Config: anneal_lr={ppo.anneal_lr}, clip_eps={ppo.clip_eps}, "
           f"lr={ppo.learning_rate}, num_envs={ppo.num_envs}")
-    print(f"  Network: hidden={ppo.actor.hidden_layer_sizes}, "
-          f"ortho_init={ppo.actor.use_orthogonal_init}")
+    if network_type == "cnn":
+        print(f"  Network: CNN conv={ppo.actor.conv_channels}, mlp={ppo.actor.mlp_hidden_sizes}, "
+              f"ortho_init={ppo.actor.use_orthogonal_init}")
+    else:
+        print(f"  Network: MLP hidden={ppo.actor.hidden_layer_sizes}, "
+              f"ortho_init={ppo.actor.use_orthogonal_init}")
 
     # Prepare seeds
     keys = jax.random.split(jax.random.PRNGKey(42), num_seeds)
@@ -322,13 +353,15 @@ def run_all_games(
     use_wandb: bool,
     wandb_project: str,
     padded: bool = False,
+    network_type: str = "cnn",
 ) -> Dict:
     """Run benchmark on all specified games."""
     mode_str = "padded" if padded else "native"
     results = {
-        "experiment": f"strong_single_task_baseline_{mode_str}",
-        "description": f"PureJaxRL-matching PPO with LR annealing + orthogonal init ({mode_str} envs)",
+        "experiment": f"strong_single_task_baseline_{mode_str}_{network_type}",
+        "description": f"PPO with {network_type.upper()} + LR annealing + orthogonal init ({mode_str} envs)",
         "padded": padded,
+        "network_type": network_type,
         "total_timesteps": total_timesteps,
         "num_seeds": num_seeds,
         "num_envs": num_envs,
@@ -342,10 +375,11 @@ def run_all_games(
         import wandb
         wandb_run = wandb.init(
             project=wandb_project,
-            name=f"strong_baseline_{mode_str}_{time.strftime('%Y%m%d_%H%M%S')}",
+            name=f"strong_baseline_{mode_str}_{network_type}_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
-                "experiment": f"strong_single_task_baseline_{mode_str}",
+                "experiment": f"strong_single_task_baseline_{mode_str}_{network_type}",
                 "padded": padded,
+                "network_type": network_type,
                 "total_timesteps": total_timesteps,
                 "num_seeds": num_seeds,
                 "num_envs": num_envs,
@@ -353,7 +387,7 @@ def run_all_games(
                 "games": games,
                 "anneal_lr": True,
                 "use_orthogonal_init": True,
-                "clip_eps": 0.1,
+                "clip_eps": 0.2,
                 "learning_rate": 2.5e-4,
             },
         )
@@ -368,6 +402,7 @@ def run_all_games(
             use_wandb=use_wandb,
             wandb_run=wandb_run,
             padded=padded,
+            network_type=network_type,
         )
         results["per_game_results"].append(game_result.to_dict())
 
@@ -484,8 +519,13 @@ def main():
         help="Number of seeds per game"
     )
     parser.add_argument(
-        "--num-envs", type=int, default=2048,
-        help="Parallel environments"
+        "--num-envs", type=int, default=4096,
+        help="Parallel environments (pgx default: 4096)"
+    )
+    parser.add_argument(
+        "--network-type", type=str, default="cnn",
+        choices=["cnn", "mlp"],
+        help="Network type: 'cnn' (pgx style) or 'mlp' (flattened obs)"
     )
     parser.add_argument(
         "--eval-freq", type=int, default=100_000,
@@ -516,7 +556,7 @@ def main():
 
     mode_str = "PADDED" if args.padded else "NATIVE"
     print("=" * 70)
-    print(f"Strong Single-Task Baseline (PureJaxRL-matching) - {mode_str}")
+    print(f"MinAtar PPO Baseline (pgx-matching) - {mode_str} - {args.network_type.upper()}")
     print("=" * 70)
     print(f"Games: {args.games}")
     print(f"Timesteps: {args.timesteps:,}")
@@ -524,8 +564,12 @@ def main():
     print(f"Envs: {args.num_envs}")
     print(f"Eval freq: {args.eval_freq:,}")
     print(f"Padded: {args.padded}")
+    print(f"Network: {args.network_type}")
     print("=" * 70)
-    print("Config: anneal_lr=True, use_orthogonal_init=True, clip_eps=0.1")
+    if args.network_type == "cnn":
+        print("Config: pgx-style CNN (conv32-k2 + avgpool + mlp64x3), lr=3e-4, epochs=3")
+    else:
+        print("Config: MLP (64,64), lr=3e-4, epochs=3")
     print("=" * 70)
 
     results = run_all_games(
@@ -537,6 +581,7 @@ def main():
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         padded=args.padded,
+        network_type=args.network_type,
     )
 
     # Default output dir based on mode
