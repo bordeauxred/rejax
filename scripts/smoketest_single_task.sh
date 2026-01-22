@@ -19,7 +19,7 @@ set -e
 
 TIMESTEPS=${1:-5000000}
 NUM_SEEDS=${2:-2}
-NUM_ENVS=${3:-4096}
+NUM_ENVS=${3:-2048}  # CNN needs 2048 to avoid OOM with vmap
 
 echo "=============================================================="
 echo "SMOKE TEST: All Baselines on MinAtar (Single-Task)"

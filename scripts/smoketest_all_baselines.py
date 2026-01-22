@@ -38,38 +38,9 @@ GAMES = {
 }
 
 # All baseline configs to test
+# CNN configs need fewer envs due to memory (vmap × envs × conv = OOM)
 CONFIGS = {
-    # MLP baselines (4x256, Lyle et al. style)
-    "mlp_baseline": {
-        "network_type": "mlp",
-        "hidden_layer_sizes": (256, 256, 256, 256),
-        "activation": "tanh",
-        "use_orthogonal_init": True,
-        "use_bias": True,
-        "ortho_mode": None,
-        "learning_rate": 2.5e-4,
-    },
-    "mlp_adamo": {
-        "network_type": "mlp",
-        "hidden_layer_sizes": (256, 256, 256, 256),
-        "activation": "groupsort",
-        "use_orthogonal_init": False,
-        "use_bias": False,
-        "ortho_mode": "optimizer",
-        "ortho_coeff": 0.1,
-        "learning_rate": 2.5e-4,
-    },
-    "mlp_adamo_lyle": {
-        "network_type": "mlp",
-        "hidden_layer_sizes": (256, 256, 256, 256),
-        "activation": "groupsort",
-        "use_orthogonal_init": False,
-        "use_bias": False,
-        "ortho_mode": "optimizer",
-        "ortho_coeff": 0.1,
-        "learning_rate": 6.25e-5,  # Lyle LR
-    },
-    # CNN baselines (pgx style)
+    # CNN baselines FIRST (pgx style) - use 2048 envs to avoid OOM
     "cnn_baseline": {
         "network_type": "cnn",
         "conv_channels": (32,),
@@ -81,6 +52,7 @@ CONFIGS = {
         "use_bias": True,
         "ortho_mode": None,
         "learning_rate": 3e-4,
+        "num_envs": 2048,  # Reduced for CNN memory
     },
     "cnn_adamo": {
         "network_type": "cnn",
@@ -94,6 +66,7 @@ CONFIGS = {
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "learning_rate": 3e-4,
+        "num_envs": 2048,
     },
     "cnn_adamo_lyle": {
         "network_type": "cnn",
@@ -107,11 +80,42 @@ CONFIGS = {
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "learning_rate": 6.25e-5,
+        "num_envs": 2048,
     },
+    # MLP baselines (4x256, Lyle et al. style) - can use 4096 envs
+    # "mlp_baseline": {
+    #     "network_type": "mlp",
+    #     "hidden_layer_sizes": (256, 256, 256, 256),
+    #     "activation": "tanh",
+    #     "use_orthogonal_init": True,
+    #     "use_bias": True,
+    #     "ortho_mode": None,
+    #     "learning_rate": 2.5e-4,
+    # },
+    # "mlp_adamo": {
+    #     "network_type": "mlp",
+    #     "hidden_layer_sizes": (256, 256, 256, 256),
+    #     "activation": "groupsort",
+    #     "use_orthogonal_init": False,
+    #     "use_bias": False,
+    #     "ortho_mode": "optimizer",
+    #     "ortho_coeff": 0.1,
+    #     "learning_rate": 2.5e-4,
+    # },
+    # "mlp_adamo_lyle": {
+    #     "network_type": "mlp",
+    #     "hidden_layer_sizes": (256, 256, 256, 256),
+    #     "activation": "groupsort",
+    #     "use_orthogonal_init": False,
+    #     "use_bias": False,
+    #     "ortho_mode": "optimizer",
+    #     "ortho_coeff": 0.1,
+    #     "learning_rate": 6.25e-5,
+    # },
 }
 
 
-def create_ppo(game_name: str, config: Dict, timesteps: int, num_envs: int) -> PPO:
+def create_ppo(game_name: str, config: Dict, timesteps: int, num_envs: int, eval_freq: int) -> PPO:
     """Create PPO instance for a game with given config."""
     env = GAMES[game_name]()
     env_params = env.default_params
@@ -138,8 +142,8 @@ def create_ppo(game_name: str, config: Dict, timesteps: int, num_envs: int) -> P
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
         "total_timesteps": timesteps,
-        "eval_freq": timesteps,  # eval only at end
-        "skip_initial_evaluation": True,
+        "eval_freq": eval_freq,
+        "skip_initial_evaluation": False,
     }
 
     if config.get("ortho_mode"):
@@ -154,11 +158,15 @@ def run_config(
     config: Dict,
     timesteps: int,
     num_seeds: int,
-    num_envs: int,
+    default_num_envs: int,
+    eval_freq: int,
 ) -> Dict[str, Dict]:
     """Run a single config on all games."""
+    # Use per-config num_envs if specified, else default
+    num_envs = config.get("num_envs", default_num_envs)
+
     print(f"\n{'='*60}")
-    print(f"Config: {config_name}")
+    print(f"Config: {config_name} (num_envs={num_envs})")
     print(f"{'='*60}")
 
     results = {}
@@ -166,7 +174,7 @@ def run_config(
     for game_name in GAMES:
         print(f"  {game_name}...", end=" ", flush=True)
 
-        ppo = create_ppo(game_name, config, timesteps, num_envs)
+        ppo = create_ppo(game_name, config, timesteps, num_envs, eval_freq)
         keys = jax.random.split(jax.random.PRNGKey(42), num_seeds)
 
         vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
@@ -176,30 +184,43 @@ def run_config(
         jax.block_until_ready(ts)
         elapsed = time.time() - start
 
-        # Final returns (last eval point)
-        final_returns = np.array(returns)[:, -1, :].mean(axis=-1)
-        mean_ret = float(final_returns.mean())
-        std_ret = float(final_returns.std())
+        returns_np = np.array(returns)  # (seeds, evals, episodes)
+
+        # First and final returns to show learning
+        first_returns = returns_np[:, 0, :].mean(axis=-1)
+        final_returns = returns_np[:, -1, :].mean(axis=-1)
+
+        first_mean = float(first_returns.mean())
+        final_mean = float(final_returns.mean())
+        final_std = float(final_returns.std())
+
+        # Check if learning happened
+        improved = final_mean > first_mean * 1.5  # >50% improvement
+        marker = "✓" if improved else "?"
 
         results[game_name] = {
-            "mean": mean_ret,
-            "std": std_ret,
+            "first": first_mean,
+            "final": final_mean,
+            "std": final_std,
+            "improved": improved,
             "time_s": elapsed,
         }
 
-        print(f"{mean_ret:6.1f} ± {std_ret:4.1f}  ({elapsed:.1f}s)")
+        print(f"{first_mean:5.1f} → {final_mean:6.1f} ± {final_std:4.1f}  ({elapsed:.1f}s) {marker}")
 
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(description="Smoke test all baselines")
-    parser.add_argument("--timesteps", type=int, default=1_000_000,
-                        help="Steps per game (default: 1M)")
+    parser.add_argument("--timesteps", type=int, default=5_000_000,
+                        help="Steps per game (default: 5M for meaningful signal)")
     parser.add_argument("--num-seeds", type=int, default=2,
                         help="Seeds per game (default: 2)")
-    parser.add_argument("--num-envs", type=int, default=4096,
-                        help="Parallel envs (default: 4096)")
+    parser.add_argument("--num-envs", type=int, default=2048,
+                        help="Parallel envs (default: 2048, CNN needs this to avoid OOM)")
+    parser.add_argument("--eval-freq", type=int, default=500_000,
+                        help="Eval frequency (default: 500k)")
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS.keys()),
                         choices=list(CONFIGS.keys()),
                         help="Configs to run")
@@ -210,11 +231,14 @@ def main():
     print("=" * 70)
     print("SMOKE TEST: All Baselines on MinAtar (Single-Task)")
     print("=" * 70)
-    print(f"Timesteps: {args.timesteps:,}")
+    print(f"Timesteps: {args.timesteps:,} (pgx uses 20M, we use {args.timesteps/20_000_000*100:.0f}%)")
     print(f"Seeds: {args.num_seeds}")
     print(f"Envs: {args.num_envs}")
+    print(f"Eval freq: {args.eval_freq:,}")
     print(f"Configs: {args.configs}")
     print(f"Games: {list(GAMES.keys())}")
+    print("=" * 70)
+    print("Output format: first_eval → final_eval ± std  (time) ✓=learning")
     print("=" * 70)
 
     total_start = time.time()
@@ -227,7 +251,8 @@ def main():
             config=config,
             timesteps=args.timesteps,
             num_seeds=args.num_seeds,
-            num_envs=args.num_envs,
+            default_num_envs=args.num_envs,
+            eval_freq=args.eval_freq,
         )
         all_results[config_name] = results
 
@@ -242,37 +267,45 @@ def main():
         json.dump({
             "timesteps": args.timesteps,
             "num_seeds": args.num_seeds,
+            "eval_freq": args.eval_freq,
             "results": all_results,
             "total_time_s": total_time,
         }, f, indent=2)
 
     # Print summary table
-    print("\n" + "=" * 90)
-    print("SUMMARY")
-    print("=" * 90)
+    print("\n" + "=" * 100)
+    print("SUMMARY (final returns)")
+    print("=" * 100)
 
     # Header
     header = f"{'Config':<20}"
     for game in GAMES:
         header += f" {game:>12}"
-    header += f" {'Mean':>10}"
+    header += f" {'Mean':>10} {'Learn?':>8}"
     print(header)
-    print("-" * 90)
+    print("-" * 100)
 
     # Results
     for config_name in args.configs:
         row = f"{config_name:<20}"
         game_means = []
+        num_improved = 0
         for game in GAMES:
             r = all_results[config_name][game]
-            row += f" {r['mean']:>12.1f}"
-            game_means.append(r['mean'])
+            row += f" {r['final']:>12.1f}"
+            game_means.append(r['final'])
+            if r['improved']:
+                num_improved += 1
         row += f" {np.mean(game_means):>10.1f}"
+        row += f" {num_improved}/5"
         print(row)
 
-    print("=" * 90)
+    print("=" * 100)
     print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
     print(f"Results saved to: {output_file}")
+    print()
+    print("pgx reference scores at 20M steps:")
+    print("  Breakout ~50, Asterix ~25, SpaceInvaders ~150, Freeway ~60, Seaquest ~60")
 
 
 if __name__ == "__main__":
