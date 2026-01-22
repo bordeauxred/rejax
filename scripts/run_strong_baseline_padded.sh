@@ -8,15 +8,12 @@ echo "=============================================="
 echo "Strong Baseline - PADDED (Continual Learning)"
 echo "=============================================="
 
-# Activate environment if needed
-# source venv/bin/activate
-
 # Set JAX to use GPU
 export JAX_PLATFORMS=cuda
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 # Run benchmark
-python scripts/bench_single_strong.py \
+uv run python scripts/bench_single_strong.py \
     --timesteps 10000000 \
     --num-seeds 5 \
     --num-envs 2048 \

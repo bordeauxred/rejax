@@ -17,9 +17,6 @@ echo ""
 echo "Total: 10M steps x 5 games x 5 seeds x 2 modes = 500M steps"
 echo ""
 
-# Activate environment if needed
-# source venv/bin/activate
-
 # Set JAX to use GPU
 export JAX_PLATFORMS=cuda
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
@@ -32,7 +29,7 @@ echo "=============================================="
 echo "Part 1/2: PADDED environments"
 echo "=============================================="
 
-python scripts/bench_single_strong.py \
+uv run python scripts/bench_single_strong.py \
     --timesteps 10000000 \
     --num-seeds 5 \
     --num-envs 2048 \
@@ -50,7 +47,7 @@ echo "=============================================="
 echo "Part 2/2: NATIVE environments"
 echo "=============================================="
 
-python scripts/bench_single_strong.py \
+uv run python scripts/bench_single_strong.py \
     --timesteps 10000000 \
     --num-seeds 5 \
     --num-envs 2048 \
