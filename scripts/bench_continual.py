@@ -144,6 +144,40 @@ def create_lyle_lr_schedule(initial_lr: float, final_lr: float, total_steps: int
     )
 
 
+def create_lyle_continual_schedule(peak_lr: float, final_lr: float, warmup_steps: int, total_steps: int):
+    """
+    Lyle et al. cosine decay with warmup schedule for continual learning.
+
+    Per paper B.2: init_value=1e-8, peak after warmup, cosine decay to end_value.
+    This schedule should be RESTARTED at every game change.
+
+    Args:
+        peak_lr: Peak learning rate after warmup (e.g., 6.25e-4)
+        final_lr: Final learning rate (e.g., 1e-6)
+        warmup_steps: Number of warmup steps (e.g., 1000)
+        total_steps: Total number of gradient steps per game
+
+    Returns:
+        optax schedule function
+    """
+    # For smoke tests with small step counts, adjust warmup and decay proportionally
+    if total_steps <= warmup_steps:
+        # Split total_steps: 10% warmup, 90% decay (minimum 1 each)
+        effective_warmup = max(1, total_steps // 10)
+        decay_steps = max(1, total_steps - effective_warmup)
+    else:
+        effective_warmup = warmup_steps
+        decay_steps = total_steps - warmup_steps
+
+    return optax.warmup_cosine_decay_schedule(
+        init_value=1e-8,
+        peak_value=peak_lr,
+        warmup_steps=effective_warmup,
+        decay_steps=decay_steps,
+        end_value=final_lr,
+    )
+
+
 def create_ppo_config(
     env,
     env_params,
@@ -155,6 +189,7 @@ def create_ppo_config(
     lr_schedule: str = "constant",
     learning_rate: float = 2.5e-4,
     final_lr: float = 1e-6,
+    warmup_steps: int = 1000,
     use_bias: bool = True,
     num_envs: int = 2048,
     eval_freq: int = 500_000,
@@ -206,6 +241,23 @@ def create_ppo_config(
     if ortho_mode and ortho_mode != "none":
         config["ortho_mode"] = ortho_mode
         config["ortho_coeff"] = ortho_coeff
+
+    # Handle Lyle continual learning schedule
+    if lr_schedule == "lyle_continual":
+        # Calculate total gradient steps per game
+        num_steps_per_iter = 128  # PPO num_steps (rollout length)
+        num_epochs = 4   # PPO num_epochs
+        num_minibatches = 4  # PPO num_minibatches
+        iteration_steps = num_envs * num_steps_per_iter
+        num_iterations = max(1, total_timesteps // iteration_steps)
+        total_grad_steps = num_iterations * num_epochs * num_minibatches
+
+        config["lr_schedule_fn"] = create_lyle_continual_schedule(
+            peak_lr=learning_rate,
+            final_lr=final_lr,
+            warmup_steps=warmup_steps,
+            total_steps=total_grad_steps,
+        )
 
     return config
 
@@ -327,6 +379,19 @@ EXPERIMENT_CONFIGS_LEGACY = [
         "final_lr": 1e-6,
         "use_bias": False,
     },
+    {
+        "name": "ortho_adamo_lyle_continual",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "groupsort",
+        "lr_schedule": "lyle_continual",  # Cosine warmup schedule, restarted per game
+        "learning_rate": 6.25e-4,         # Peak LR (Rainbow default)
+        "warmup_steps": 1000,
+        "final_lr": 1e-6,
+        "use_bias": False,
+    },
 ]
 
 
@@ -408,6 +473,7 @@ class ContinualTrainer:
             lr_schedule=self.experiment_config.get("lr_schedule", "constant"),
             learning_rate=self.experiment_config.get("learning_rate", 2.5e-4),
             final_lr=self.experiment_config.get("final_lr", 1e-6),
+            warmup_steps=self.experiment_config.get("warmup_steps", 1000),
             use_bias=self.experiment_config.get("use_bias", True),
             num_envs=self.num_envs,
             eval_freq=self.eval_freq,
@@ -417,23 +483,44 @@ class ContinualTrainer:
         return PPO.create(**config)
 
     def _transfer_train_state(self, old_ts, new_ppo, rng):
-        """Transfer network weights to a new environment's train state."""
+        """Transfer network weights to a new environment's train state.
+
+        For Lyle continual schedule: resets optimizer state and global_step
+        to restart the LR schedule from warmup at each game boundary.
+        """
         # Initialize a fresh train state for the new environment
         new_ts = new_ppo.init_state(rng)
 
-        # Transfer actor and critic params (network weights)
-        new_ts = new_ts.replace(
-            actor_ts=new_ts.actor_ts.replace(
-                params=old_ts.actor_ts.params,
-                opt_state=old_ts.actor_ts.opt_state,
-            ),
-            critic_ts=new_ts.critic_ts.replace(
-                params=old_ts.critic_ts.params,
-                opt_state=old_ts.critic_ts.opt_state,
-            ),
-            # Preserve global step for tracking
-            global_step=old_ts.global_step,
-        )
+        reset_optimizer = self.experiment_config.get("lr_schedule") == "lyle_continual"
+
+        if reset_optimizer:
+            # Lyle style: transfer params, RESET optimizer state & schedule
+            # This allows the LR schedule to restart from warmup for each new game
+            new_ts = new_ts.replace(
+                actor_ts=new_ts.actor_ts.replace(
+                    params=old_ts.actor_ts.params,
+                    # opt_state stays fresh (new schedule, zeroed momentum)
+                ),
+                critic_ts=new_ts.critic_ts.replace(
+                    params=old_ts.critic_ts.params,
+                    # opt_state stays fresh (new schedule, zeroed momentum)
+                ),
+                global_step=jnp.array(0),  # Reset for new schedule
+            )
+        else:
+            # Original behavior: preserve optimizer state
+            new_ts = new_ts.replace(
+                actor_ts=new_ts.actor_ts.replace(
+                    params=old_ts.actor_ts.params,
+                    opt_state=old_ts.actor_ts.opt_state,
+                ),
+                critic_ts=new_ts.critic_ts.replace(
+                    params=old_ts.critic_ts.params,
+                    opt_state=old_ts.critic_ts.opt_state,
+                ),
+                # Preserve global step for tracking
+                global_step=old_ts.global_step,
+            )
         return new_ts
 
     def _make_progress_callback(self, game_name: str, cycle_idx: int, original_eval_callback):
@@ -627,6 +714,7 @@ def create_ppo_for_game_with_config(
         lr_schedule=experiment_config.get("lr_schedule", "constant"),
         learning_rate=experiment_config.get("learning_rate", 2.5e-4),
         final_lr=experiment_config.get("final_lr", 1e-6),
+        warmup_steps=experiment_config.get("warmup_steps", 1000),
         use_bias=experiment_config.get("use_bias", True),
         num_envs=num_envs,
         eval_freq=steps_per_game,  # Eval only at end for parallel mode
@@ -718,17 +806,34 @@ def run_experiment_parallel(
 
                     # Transfer network weights from previous train_states
                     # Note: train_states has shape (num_seeds, ...) from vmap
-                    new_train_states = new_train_states.replace(
-                        actor_ts=new_train_states.actor_ts.replace(
-                            params=train_states.actor_ts.params,
-                            opt_state=train_states.actor_ts.opt_state,
-                        ),
-                        critic_ts=new_train_states.critic_ts.replace(
-                            params=train_states.critic_ts.params,
-                            opt_state=train_states.critic_ts.opt_state,
-                        ),
-                        global_step=train_states.global_step,
-                    )
+                    reset_optimizer = experiment_config.get("lr_schedule") == "lyle_continual"
+
+                    if reset_optimizer:
+                        # Lyle style: transfer params, RESET optimizer state & schedule
+                        new_train_states = new_train_states.replace(
+                            actor_ts=new_train_states.actor_ts.replace(
+                                params=train_states.actor_ts.params,
+                                # opt_state stays fresh (new schedule, zeroed momentum)
+                            ),
+                            critic_ts=new_train_states.critic_ts.replace(
+                                params=train_states.critic_ts.params,
+                                # opt_state stays fresh (new schedule, zeroed momentum)
+                            ),
+                            global_step=jnp.zeros_like(train_states.global_step),
+                        )
+                    else:
+                        # Original behavior: preserve optimizer state
+                        new_train_states = new_train_states.replace(
+                            actor_ts=new_train_states.actor_ts.replace(
+                                params=train_states.actor_ts.params,
+                                opt_state=train_states.actor_ts.opt_state,
+                            ),
+                            critic_ts=new_train_states.critic_ts.replace(
+                                params=train_states.critic_ts.params,
+                                opt_state=train_states.critic_ts.opt_state,
+                            ),
+                            global_step=train_states.global_step,
+                        )
 
                     # Continue training from transferred weights
                     train_rngs = jax.random.split(jax.random.PRNGKey(seed + cycle_idx * 1000 + game_idx * 10), num_seeds)

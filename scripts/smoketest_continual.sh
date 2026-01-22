@@ -47,7 +47,7 @@ echo "Test 2: Running continual benchmark smoke test..."
 echo "  - 100k steps per game"
 echo "  - 1 cycle"
 echo "  - 2 seeds"
-echo "  - All 3 configs: baseline, ortho_adamo, ortho_adamo_lyle_lr"
+echo "  - All 4 configs: baseline, ortho_adamo, ortho_adamo_lyle_lr, ortho_adamo_lyle_continual"
 echo "  - With wandb logging"
 echo ""
 
@@ -55,7 +55,7 @@ uv run python scripts/bench_continual.py \
     --steps-per-game 50000 \
     --num-cycles 2 \
     --num-seeds 2 \
-    --configs baseline ortho_adamo ortho_adamo_lyle_lr \
+    --configs baseline ortho_adamo ortho_adamo_lyle_lr ortho_adamo_lyle_continual \
     --use-wandb \
     --wandb-project rejax-ppo-continual-minatar-smoketest
 
