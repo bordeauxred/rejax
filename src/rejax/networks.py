@@ -90,6 +90,190 @@ def parse_activation_fn(name: str):
     raise ValueError(f"Unknown activation function: {name}")
 
 
+# CNN Feature Extractor and Networks
+
+
+class CNN(nn.Module):
+    """
+    Configurable CNN feature extractor for image observations.
+
+    Two modes:
+    - "minatar" (default): pgx MinAtar PPO style
+        - Single conv (32, kernel=2) + avgpool(2x2) + MLP (64, 64, 64)
+        - Optimized for 10x10 MinAtar images
+    - "atari": CleanRL Atari style
+        - Multiple conv layers (32, 64, 64), kernels (8, 4, 3), strides (4, 2, 1)
+        - MLP layer (512)
+        - For 84x84 Atari images
+
+    For custom architectures, use conv_channels and mlp_hidden_sizes directly.
+    """
+    conv_channels: Sequence[int] = (32,)  # pgx MinAtar default
+    mlp_hidden_sizes: Sequence[int] = (64, 64, 64)  # pgx MinAtar default
+    activation: Callable = nn.relu
+    kernel_size: int = 2  # pgx MinAtar default
+    use_avgpool: bool = True  # pgx style: avgpool after conv
+    pool_size: int = 2
+    use_bias: bool = True
+    use_orthogonal_init: bool = False  # pgx doesn't use ortho init
+
+    @nn.compact
+    def __call__(self, x):
+        # Ensure input is (batch, H, W, C)
+        # Conv layers
+        for channels in self.conv_channels:
+            if self.use_orthogonal_init:
+                x = nn.Conv(
+                    features=channels,
+                    kernel_size=(self.kernel_size, self.kernel_size),
+                    strides=(1, 1),
+                    padding="SAME",
+                    use_bias=self.use_bias,
+                    kernel_init=orthogonal(np.sqrt(2)),
+                    bias_init=constant(0.0),
+                )(x)
+            else:
+                x = nn.Conv(
+                    features=channels,
+                    kernel_size=(self.kernel_size, self.kernel_size),
+                    strides=(1, 1),
+                    padding="SAME",
+                    use_bias=self.use_bias,
+                )(x)
+            x = self.activation(x)
+
+        # Optional average pooling (pgx style)
+        if self.use_avgpool:
+            x = nn.avg_pool(
+                x,
+                window_shape=(self.pool_size, self.pool_size),
+                strides=(self.pool_size, self.pool_size),
+                padding="VALID",
+            )
+
+        # Flatten conv features
+        x = x.reshape((x.shape[0], -1))
+
+        # MLP layers
+        for size in self.mlp_hidden_sizes:
+            if self.use_orthogonal_init:
+                x = nn.Dense(
+                    size,
+                    use_bias=self.use_bias,
+                    kernel_init=orthogonal(np.sqrt(2)),
+                    bias_init=constant(0.0),
+                )(x)
+            else:
+                x = nn.Dense(size, use_bias=self.use_bias)(x)
+            x = self.activation(x)
+
+        return x
+
+
+class DiscreteCNNPolicy(nn.Module):
+    """
+    Discrete policy with CNN backbone for image observations.
+
+    Architecture (pgx MinAtar PPO default):
+    - CNN feature extractor: conv(32, k=2) + avgpool + MLP (64, 64, 64)
+    - Action logits head
+    """
+    action_dim: int
+    conv_channels: Sequence[int] = (32,)  # pgx MinAtar default
+    mlp_hidden_sizes: Sequence[int] = (64, 64, 64)  # pgx MinAtar default
+    activation: Callable = nn.relu
+    kernel_size: int = 2  # pgx MinAtar default
+    use_avgpool: bool = True
+    pool_size: int = 2
+    use_bias: bool = True
+    use_orthogonal_init: bool = False  # pgx doesn't use ortho init
+
+    def setup(self):
+        self.features = CNN(
+            conv_channels=self.conv_channels,
+            mlp_hidden_sizes=self.mlp_hidden_sizes,
+            activation=self.activation,
+            kernel_size=self.kernel_size,
+            use_avgpool=self.use_avgpool,
+            pool_size=self.pool_size,
+            use_bias=self.use_bias,
+            use_orthogonal_init=self.use_orthogonal_init,
+        )
+        if self.use_orthogonal_init:
+            # Small scale (0.01) for action output - critical for stability
+            self.action_logits = nn.Dense(
+                self.action_dim,
+                use_bias=self.use_bias,
+                kernel_init=orthogonal(0.01),
+                bias_init=constant(0.0),
+            )
+        else:
+            self.action_logits = nn.Dense(self.action_dim, use_bias=self.use_bias)
+
+    def _action_dist(self, obs):
+        features = self.features(obs)
+        action_logits = self.action_logits(features)
+        return distrax.Categorical(logits=action_logits)
+
+    def __call__(self, obs, rng):
+        action_dist = self._action_dist(obs)
+        action = action_dist.sample(seed=rng)
+        return action, action_dist.log_prob(action), action_dist.entropy()
+
+    def act(self, obs, rng):
+        action, _, _ = self(obs, rng)
+        return action
+
+    def log_prob_entropy(self, obs, action):
+        action_dist = self._action_dist(obs)
+        return action_dist.log_prob(action), action_dist.entropy()
+
+    def action_log_prob(self, obs, rng):
+        action_dist = self._action_dist(obs)
+        action = action_dist.sample(seed=rng)
+        return action, action_dist.log_prob(action)
+
+
+class CNNVNetwork(nn.Module):
+    """
+    Value network with CNN backbone for image observations.
+
+    Architecture (pgx MinAtar PPO default):
+    - CNN feature extractor: conv(32, k=2) + avgpool + MLP (64, 64, 64)
+    - Single value output head
+    """
+    conv_channels: Sequence[int] = (32,)  # pgx MinAtar default
+    mlp_hidden_sizes: Sequence[int] = (64, 64, 64)  # pgx MinAtar default
+    activation: Callable = nn.relu
+    kernel_size: int = 2  # pgx MinAtar default
+    use_avgpool: bool = True
+    pool_size: int = 2
+    use_bias: bool = True
+    use_orthogonal_init: bool = False  # pgx doesn't use ortho init
+
+    @nn.compact
+    def __call__(self, obs):
+        x = CNN(
+            conv_channels=self.conv_channels,
+            mlp_hidden_sizes=self.mlp_hidden_sizes,
+            activation=self.activation,
+            kernel_size=self.kernel_size,
+            use_avgpool=self.use_avgpool,
+            pool_size=self.pool_size,
+            use_bias=self.use_bias,
+            use_orthogonal_init=self.use_orthogonal_init,
+        )(obs)
+
+        if self.use_orthogonal_init:
+            return nn.Dense(
+                1,
+                use_bias=self.use_bias,
+                kernel_init=orthogonal(1.0),
+                bias_init=constant(0.0),
+            )(x).squeeze(-1)
+        return nn.Dense(1, use_bias=self.use_bias)(x).squeeze(-1)
+
+
 class MLP(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable

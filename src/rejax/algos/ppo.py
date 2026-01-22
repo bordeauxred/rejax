@@ -16,7 +16,14 @@ from rejax.algos.mixins import (
     NormalizeRewardsMixin,
     OnPolicyMixin,
 )
-from rejax.networks import DiscretePolicy, GaussianPolicy, VNetwork, parse_activation_fn
+from rejax.networks import (
+    DiscretePolicy,
+    GaussianPolicy,
+    VNetwork,
+    parse_activation_fn,
+    DiscreteCNNPolicy,
+    CNNVNetwork,
+)
 from rejax.regularization import compute_gram_regularization_loss, apply_ortho_update
 
 
@@ -67,26 +74,78 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     @classmethod
     def create_agent(cls, config, env, env_params):
         action_space = env.action_space(env_params)
+        obs_space = env.observation_space(env_params)
         discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
 
         agent_kwargs = config.pop("agent_kwargs", {})
-        activation = agent_kwargs.pop("activation", "swish")
-        # Use parse_activation_fn to support groupsort variants
-        agent_kwargs["activation"] = parse_activation_fn(activation)
 
-        hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
-        agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
+        # Network type: "auto", "mlp", or "cnn"
+        network_type = agent_kwargs.pop("network_type", "auto")
 
-        if discrete:
-            actor = DiscretePolicy(action_space.n, **agent_kwargs)
+        # Auto-detect: use CNN if observation is 3D (H, W, C)
+        if network_type == "auto":
+            obs_shape = obs_space.shape
+            network_type = "cnn" if len(obs_shape) == 3 else "mlp"
+
+        # Parse activation function
+        activation = agent_kwargs.pop("activation", "relu" if network_type == "cnn" else "swish")
+        activation_fn = parse_activation_fn(activation)
+
+        if network_type == "cnn":
+            # CNN architecture for image observations
+            # Default to pgx MinAtar style: conv(32, k=2) + avgpool + MLP(64,64,64)
+            conv_channels = agent_kwargs.pop("conv_channels", (32,))
+            mlp_hidden_sizes = agent_kwargs.pop("mlp_hidden_sizes", (64, 64, 64))
+            kernel_size = agent_kwargs.pop("kernel_size", 2)
+            use_avgpool = agent_kwargs.pop("use_avgpool", True)
+            pool_size = agent_kwargs.pop("pool_size", 2)
+
+            # Also accept hidden_layer_sizes for backward compat, but mlp_hidden_sizes takes precedence
+            if "hidden_layer_sizes" in agent_kwargs:
+                hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes")
+                if mlp_hidden_sizes == (64, 64, 64):  # only use if mlp_hidden_sizes wasn't explicitly set
+                    mlp_hidden_sizes = tuple(hidden_layer_sizes)
+
+            cnn_kwargs = {
+                "conv_channels": tuple(conv_channels),
+                "mlp_hidden_sizes": tuple(mlp_hidden_sizes),
+                "activation": activation_fn,
+                "kernel_size": kernel_size,
+                "use_avgpool": use_avgpool,
+                "pool_size": pool_size,
+                **agent_kwargs,  # pass through use_bias, use_orthogonal_init, etc.
+            }
+
+            if not discrete:
+                raise NotImplementedError("CNN with continuous actions not yet supported")
+
+            actor = DiscreteCNNPolicy(action_space.n, **cnn_kwargs)
+            critic = CNNVNetwork(**cnn_kwargs)
         else:
-            actor = GaussianPolicy(
-                np.prod(action_space.shape),
-                (action_space.low, action_space.high),
-                **agent_kwargs,
-            )
+            # MLP architecture (original behavior)
+            hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
+            # Remove CNN-specific args if present
+            agent_kwargs.pop("conv_channels", None)
+            agent_kwargs.pop("mlp_hidden_sizes", None)
+            agent_kwargs.pop("kernel_size", None)
 
-        critic = VNetwork(**agent_kwargs)
+            mlp_kwargs = {
+                "hidden_layer_sizes": tuple(hidden_layer_sizes),
+                "activation": activation_fn,
+                **agent_kwargs,
+            }
+
+            if discrete:
+                actor = DiscretePolicy(action_space.n, **mlp_kwargs)
+            else:
+                actor = GaussianPolicy(
+                    np.prod(action_space.shape),
+                    (action_space.low, action_space.high),
+                    **mlp_kwargs,
+                )
+
+            critic = VNetwork(**mlp_kwargs)
+
         return {"actor": actor, "critic": critic}
 
     @register_init
@@ -98,18 +157,17 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         critic_params = self.critic.init(rng_critic, obs_ph)
 
         # Learning rate: constant or linear annealing (like PureJaxRL)
+        # Use optax.linear_schedule to avoid capturing self.learning_rate (a pytree leaf/tracer) in a closure
         if self.anneal_lr:
             # Number of updates = total_timesteps / (num_envs * num_steps)
             # Each update has num_epochs * num_minibatches gradient steps
             num_updates = self.total_timesteps // (self.num_envs * self.num_steps)
-
-            def lr_schedule(count):
-                # count increments each gradient step
-                # frac goes from 1.0 to 0.0 over training
-                frac = 1.0 - (count // (self.num_minibatches * self.num_epochs)) / num_updates
-                return self.learning_rate * frac
-
-            learning_rate = lr_schedule
+            total_steps = num_updates * self.num_epochs * self.num_minibatches
+            learning_rate = optax.linear_schedule(
+                init_value=self.learning_rate,
+                end_value=0.0,
+                transition_steps=total_steps,
+            )
         else:
             learning_rate = self.learning_rate
 

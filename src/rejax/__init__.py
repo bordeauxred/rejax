@@ -1,4 +1,5 @@
 from rejax.algos import DQN, IQN, PPO, PQN, SAC, TD3, Algorithm
+from rejax.networks import CNN, DiscreteCNNPolicy, CNNVNetwork
 
 
 _algos = {
@@ -24,4 +25,8 @@ __all__ = [
     "SAC",
     "TD3",
     "get_algo",
+    # CNN networks for image observations
+    "CNN",
+    "DiscreteCNNPolicy",
+    "CNNVNetwork",
 ]
