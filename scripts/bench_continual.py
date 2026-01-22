@@ -486,6 +486,13 @@ class ContinualTrainer:
                             "cycle_idx": cycle_idx,
                         })
 
+                # Save intermediate results after each game completes
+                if self.checkpoint_dir:
+                    intermediate_path = self.checkpoint_dir.parent / f"{self.config_name}_intermediate.json"
+                    with open(intermediate_path, "w") as f:
+                        json.dump(self.results, f, indent=2, default=str)
+                    print(f"  Saved intermediate results: {intermediate_path}")
+
             # Reset start_game for subsequent cycles
             start_game = 0
 
@@ -889,6 +896,9 @@ def main():
 
                 results = trainer.run(rng)
                 all_experiment_results[config_name].append(results)
+
+                # Save intermediate results after each seed/config completes
+                save_results(all_experiment_results, output_dir)
 
                 if args.use_wandb:
                     import wandb
