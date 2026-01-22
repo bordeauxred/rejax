@@ -44,6 +44,9 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     vf_coef: chex.Scalar = struct.field(pytree_node=True, default=0.5)
     ent_coef: chex.Scalar = struct.field(pytree_node=True, default=0.01)
 
+    # Learning rate annealing (like PureJaxRL)
+    anneal_lr: bool = struct.field(pytree_node=False, default=False)
+
     # Orthonormalization settings
     ortho_mode: Optional[str] = struct.field(pytree_node=False, default=None)  # None, "loss", "optimizer"
     ortho_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.2)  # loss mode coefficient
@@ -94,9 +97,25 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         actor_params = self.actor.init(rng_actor, obs_ph, rng_actor)
         critic_params = self.critic.init(rng_critic, obs_ph)
 
+        # Learning rate: constant or linear annealing (like PureJaxRL)
+        if self.anneal_lr:
+            # Number of updates = total_timesteps / (num_envs * num_steps)
+            # Each update has num_epochs * num_minibatches gradient steps
+            num_updates = self.total_timesteps // (self.num_envs * self.num_steps)
+
+            def lr_schedule(count):
+                # count increments each gradient step
+                # frac goes from 1.0 to 0.0 over training
+                frac = 1.0 - (count // (self.num_minibatches * self.num_epochs)) / num_updates
+                return self.learning_rate * frac
+
+            learning_rate = lr_schedule
+        else:
+            learning_rate = self.learning_rate
+
         tx = optax.chain(
-            optax.clip(self.max_grad_norm),
-            optax.adam(learning_rate=self.learning_rate),
+            optax.clip_by_global_norm(self.max_grad_norm),
+            optax.adam(learning_rate=learning_rate, eps=1e-5),
         )
         actor_ts = TrainState.create(apply_fn=(), params=actor_params, tx=tx)
         critic_ts = TrainState.create(apply_fn=(), params=critic_params, tx=tx)
