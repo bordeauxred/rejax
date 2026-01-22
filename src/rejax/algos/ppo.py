@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Callable, Optional
 
 import chex
 import gymnax
@@ -53,6 +53,9 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
 
     # Learning rate annealing (like PureJaxRL)
     anneal_lr: bool = struct.field(pytree_node=False, default=False)
+
+    # Custom LR schedule function (takes precedence over anneal_lr)
+    lr_schedule_fn: Optional[Callable[[int], float]] = struct.field(pytree_node=False, default=None)
 
     # Orthonormalization settings
     ortho_mode: Optional[str] = struct.field(pytree_node=False, default=None)  # None, "loss", "optimizer"
@@ -156,9 +159,12 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         actor_params = self.actor.init(rng_actor, obs_ph, rng_actor)
         critic_params = self.critic.init(rng_critic, obs_ph)
 
-        # Learning rate: constant or linear annealing (like PureJaxRL)
+        # Learning rate: priority is lr_schedule_fn > anneal_lr > constant
         # Use optax.linear_schedule to avoid capturing self.learning_rate (a pytree leaf/tracer) in a closure
-        if self.anneal_lr:
+        if self.lr_schedule_fn is not None:
+            # Custom schedule function takes precedence
+            learning_rate = self.lr_schedule_fn
+        elif self.anneal_lr:
             # Number of updates = total_timesteps / (num_envs * num_steps)
             # Each update has num_epochs * num_minibatches gradient steps
             num_updates = self.total_timesteps // (self.num_envs * self.num_steps)

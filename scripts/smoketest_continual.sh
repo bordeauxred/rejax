@@ -57,7 +57,7 @@ uv run python scripts/bench_continual.py \
     --num-seeds 2 \
     --configs baseline ortho_adamo ortho_adamo_lyle_lr \
     --use-wandb \
-    --wandb-project rejax-continual-smoketest
+    --wandb-project rejax-ppo-continual-minatar-smoketest
 
 echo ""
 echo "=============================================="
