@@ -2,8 +2,9 @@ from collections.abc import Callable, Sequence
 
 import distrax
 import jax
+import numpy as np
 from flax import linen as nn
-from flax.linen.initializers import constant
+from flax.linen.initializers import constant, orthogonal
 from jax import numpy as jnp
 from jax import lax
 
@@ -93,12 +94,21 @@ class MLP(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
     use_bias: bool = True
+    use_orthogonal_init: bool = False
 
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
         for size in self.hidden_layer_sizes:
-            x = nn.Dense(size, use_bias=self.use_bias)(x)
+            if self.use_orthogonal_init:
+                x = nn.Dense(
+                    size,
+                    use_bias=self.use_bias,
+                    kernel_init=orthogonal(np.sqrt(2)),
+                    bias_init=constant(0.0),
+                )(x)
+            else:
+                x = nn.Dense(size, use_bias=self.use_bias)(x)
             x = self.activation(x)
         return x
 
@@ -111,10 +121,25 @@ class DiscretePolicy(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
     use_bias: bool = True
+    use_orthogonal_init: bool = False
 
     def setup(self):
-        self.features = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)
-        self.action_logits = nn.Dense(self.action_dim, use_bias=self.use_bias)
+        self.features = MLP(
+            self.hidden_layer_sizes,
+            self.activation,
+            use_bias=self.use_bias,
+            use_orthogonal_init=self.use_orthogonal_init,
+        )
+        if self.use_orthogonal_init:
+            # Small scale (0.01) for action output - critical for stability
+            self.action_logits = nn.Dense(
+                self.action_dim,
+                use_bias=self.use_bias,
+                kernel_init=orthogonal(0.01),
+                bias_init=constant(0.0),
+            )
+        else:
+            self.action_logits = nn.Dense(self.action_dim, use_bias=self.use_bias)
 
     def _action_dist(self, obs):
         features = self.features(obs)
@@ -160,10 +185,25 @@ class GaussianPolicy(nn.Module):
     hidden_layer_sizes: Sequence[int]
     activation: Callable
     use_bias: bool = True
+    use_orthogonal_init: bool = False
 
     def setup(self):
-        self.features = MLP(self.hidden_layer_sizes, self.activation, use_bias=self.use_bias)
-        self.action_mean = nn.Dense(self.action_dim, use_bias=self.use_bias)
+        self.features = MLP(
+            self.hidden_layer_sizes,
+            self.activation,
+            use_bias=self.use_bias,
+            use_orthogonal_init=self.use_orthogonal_init,
+        )
+        if self.use_orthogonal_init:
+            # Small scale (0.01) for action output - critical for stability
+            self.action_mean = nn.Dense(
+                self.action_dim,
+                use_bias=self.use_bias,
+                kernel_init=orthogonal(0.01),
+                bias_init=constant(0.0),
+            )
+        else:
+            self.action_mean = nn.Dense(self.action_dim, use_bias=self.use_bias)
         self.action_log_std = self.param(
             "action_log_std", constant(0.0), (self.action_dim,)
         )
@@ -345,6 +385,13 @@ class VNetwork(MLP):
     @nn.compact
     def __call__(self, obs):
         x = super().__call__(obs)
+        if self.use_orthogonal_init:
+            return nn.Dense(
+                1,
+                use_bias=self.use_bias,
+                kernel_init=orthogonal(1.0),
+                bias_init=constant(0.0),
+            )(x).squeeze(1)
         return nn.Dense(1, use_bias=self.use_bias)(x).squeeze(1)
 
 
