@@ -1,6 +1,6 @@
 #!/bin/bash
 # Smoke test: All baselines on all MinAtar games (single-task)
-# Target: ~20 min on A100, verify learning + no bugs before overnight continual runs
+# Target: ~20-30 min on A100, verify learning + no bugs before overnight continual runs
 #
 # Configs tested:
 #   - mlp_baseline:    MLP 4x256, tanh, orthogonal init
@@ -11,20 +11,20 @@
 #   - cnn_adamo_lyle:  CNN pgx-style, relu, AdaMO + Lyle LR
 #
 # Usage:
-#   ./scripts/smoketest_single_task.sh              # Default: 1M steps, 2 seeds
-#   ./scripts/smoketest_single_task.sh 500000 1     # Fast: 500k steps, 1 seed
-#   ./scripts/smoketest_single_task.sh 2000000 3    # Longer: 2M steps, 3 seeds
+#   ./scripts/smoketest_single_task.sh              # Default: 5M steps (25% of full), 2 seeds
+#   ./scripts/smoketest_single_task.sh 2000000 1    # Fast: 2M steps, 1 seed (~10 min)
+#   ./scripts/smoketest_single_task.sh 10000000 3   # Long: 10M steps, 3 seeds (~1hr)
 
 set -e
 
-TIMESTEPS=${1:-1000000}
+TIMESTEPS=${1:-5000000}
 NUM_SEEDS=${2:-2}
 NUM_ENVS=${3:-4096}
 
 echo "=============================================================="
 echo "SMOKE TEST: All Baselines on MinAtar (Single-Task)"
 echo "=============================================================="
-echo "Timesteps: $TIMESTEPS"
+echo "Timesteps: $TIMESTEPS (pgx uses 20M)"
 echo "Seeds: $NUM_SEEDS"
 echo "Envs: $NUM_ENVS"
 echo "=============================================================="
