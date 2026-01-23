@@ -95,27 +95,31 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         activation_fn = parse_activation_fn(activation)
 
         if network_type == "cnn":
-            # CNN architecture for image observations
-            # Default to pgx MinAtar style: conv(32, k=2) + avgpool + MLP(64,64,64)
-            conv_channels = agent_kwargs.pop("conv_channels", (32,))
-            mlp_hidden_sizes = agent_kwargs.pop("mlp_hidden_sizes", (64, 64, 64))
-            kernel_size = agent_kwargs.pop("kernel_size", 2)
-            use_avgpool = agent_kwargs.pop("use_avgpool", True)
-            pool_size = agent_kwargs.pop("pool_size", 2)
+            # CNN architecture for MinAtar (10x10 images)
+            # Conv(16, k=3, VALID) -> flatten -> MLP (default 4x256 for AdaMO research)
+            conv_channels = agent_kwargs.pop("conv_channels", 16)
+            # Support both mlp_hidden_sizes (new) and mlp_hidden_size (old)
+            mlp_hidden_sizes = agent_kwargs.pop("mlp_hidden_sizes", None)
+            mlp_hidden_size = agent_kwargs.pop("mlp_hidden_size", None)
+            if mlp_hidden_sizes is None:
+                if mlp_hidden_size is not None:
+                    # Single int -> convert to tuple
+                    mlp_hidden_sizes = (mlp_hidden_size,)
+                else:
+                    # Default: 4x256 for AdaMO research
+                    mlp_hidden_sizes = (256, 256, 256, 256)
+            kernel_size = agent_kwargs.pop("kernel_size", 3)
 
-            # Also accept hidden_layer_sizes for backward compat, but mlp_hidden_sizes takes precedence
-            if "hidden_layer_sizes" in agent_kwargs:
-                hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes")
-                if mlp_hidden_sizes == (64, 64, 64):  # only use if mlp_hidden_sizes wasn't explicitly set
-                    mlp_hidden_sizes = tuple(hidden_layer_sizes)
+            # Remove deprecated params if present
+            agent_kwargs.pop("use_avgpool", None)
+            agent_kwargs.pop("pool_size", None)
+            agent_kwargs.pop("hidden_layer_sizes", None)
 
             cnn_kwargs = {
-                "conv_channels": tuple(conv_channels),
+                "conv_channels": conv_channels,
                 "mlp_hidden_sizes": tuple(mlp_hidden_sizes),
                 "activation": activation_fn,
                 "kernel_size": kernel_size,
-                "use_avgpool": use_avgpool,
-                "pool_size": pool_size,
                 **agent_kwargs,  # pass through use_bias, use_orthogonal_init, etc.
             }
 

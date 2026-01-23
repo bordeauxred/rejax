@@ -95,66 +95,51 @@ def parse_activation_fn(name: str):
 
 class CNN(nn.Module):
     """
-    Configurable CNN feature extractor for image observations.
+    CNN feature extractor for MinAtar (10x10 images).
 
-    Two modes:
-    - "minatar" (default): pgx MinAtar PPO style
-        - Single conv (32, kernel=2) + avgpool(2x2) + MLP (64, 64, 64)
-        - Optimized for 10x10 MinAtar images
-    - "atari": CleanRL Atari style
-        - Multiple conv layers (32, 64, 64), kernels (8, 4, 3), strides (4, 2, 1)
-        - MLP layer (512)
-        - For 84x84 Atari images
+    Architecture:
+    - Conv: 16 filters, 3x3 kernel, stride 1, VALID padding -> 8x8x16
+    - Flatten -> 1024
+    - MLP: configurable depth (default 4x256 for AdaMO research)
 
-    For custom architectures, use conv_channels and mlp_hidden_sizes directly.
+    For AdaMO/plasticity research, deeper MLP (4x256) is important.
+    For simple baselines, can use shallow MLP (1x128).
     """
-    conv_channels: Sequence[int] = (32,)  # pgx MinAtar default
-    mlp_hidden_sizes: Sequence[int] = (64, 64, 64)  # pgx MinAtar default
+    conv_channels: int = 16  # CleanRL MinAtar default
+    mlp_hidden_sizes: Sequence[int] = (256, 256, 256, 256)  # 4x256 for AdaMO
     activation: Callable = nn.relu
-    kernel_size: int = 2  # pgx MinAtar default
-    use_avgpool: bool = True  # pgx style: avgpool after conv
-    pool_size: int = 2
+    kernel_size: int = 3
     use_bias: bool = True
-    use_orthogonal_init: bool = False  # pgx doesn't use ortho init
+    use_orthogonal_init: bool = True
 
     @nn.compact
     def __call__(self, x):
-        # Ensure input is (batch, H, W, C)
-        # Conv layers
-        for channels in self.conv_channels:
-            if self.use_orthogonal_init:
-                x = nn.Conv(
-                    features=channels,
-                    kernel_size=(self.kernel_size, self.kernel_size),
-                    strides=(1, 1),
-                    padding="SAME",
-                    use_bias=self.use_bias,
-                    kernel_init=orthogonal(np.sqrt(2)),
-                    bias_init=constant(0.0),
-                )(x)
-            else:
-                x = nn.Conv(
-                    features=channels,
-                    kernel_size=(self.kernel_size, self.kernel_size),
-                    strides=(1, 1),
-                    padding="SAME",
-                    use_bias=self.use_bias,
-                )(x)
-            x = self.activation(x)
-
-        # Optional average pooling (pgx style)
-        if self.use_avgpool:
-            x = nn.avg_pool(
-                x,
-                window_shape=(self.pool_size, self.pool_size),
-                strides=(self.pool_size, self.pool_size),
+        # Single conv layer
+        # Input: (batch, 10, 10, C), Output: (batch, 8, 8, 16)
+        if self.use_orthogonal_init:
+            x = nn.Conv(
+                features=self.conv_channels,
+                kernel_size=(self.kernel_size, self.kernel_size),
+                strides=(1, 1),
+                padding="VALID",  # No padding -> 10-3+1 = 8
+                use_bias=self.use_bias,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(x)
+        else:
+            x = nn.Conv(
+                features=self.conv_channels,
+                kernel_size=(self.kernel_size, self.kernel_size),
+                strides=(1, 1),
                 padding="VALID",
-            )
+                use_bias=self.use_bias,
+            )(x)
+        x = self.activation(x)
 
-        # Flatten conv features
+        # Flatten: 8*8*16 = 1024
         x = x.reshape((x.shape[0], -1))
 
-        # MLP layers
+        # MLP layers (4x256 default for AdaMO research)
         for size in self.mlp_hidden_sizes:
             if self.use_orthogonal_init:
                 x = nn.Dense(
@@ -172,21 +157,21 @@ class CNN(nn.Module):
 
 class DiscreteCNNPolicy(nn.Module):
     """
-    Discrete policy with CNN backbone for image observations.
+    Discrete policy with CNN backbone for MinAtar (10x10 images).
 
-    Architecture (pgx MinAtar PPO default):
-    - CNN feature extractor: conv(32, k=2) + avgpool + MLP (64, 64, 64)
-    - Action logits head
+    Architecture:
+    - Conv: 16 filters, 3x3, VALID -> 8x8x16
+    - Flatten -> 1024
+    - MLP: configurable depth (default 4x256 for AdaMO research)
+    - Actor head: action_dim
     """
     action_dim: int
-    conv_channels: Sequence[int] = (32,)  # pgx MinAtar default
-    mlp_hidden_sizes: Sequence[int] = (64, 64, 64)  # pgx MinAtar default
+    conv_channels: int = 16  # CleanRL MinAtar default
+    mlp_hidden_sizes: Sequence[int] = (256, 256, 256, 256)  # 4x256 for AdaMO
     activation: Callable = nn.relu
-    kernel_size: int = 2  # pgx MinAtar default
-    use_avgpool: bool = True
-    pool_size: int = 2
+    kernel_size: int = 3
     use_bias: bool = True
-    use_orthogonal_init: bool = False  # pgx doesn't use ortho init
+    use_orthogonal_init: bool = True  # CleanRL uses orthogonal init
 
     def setup(self):
         self.features = CNN(
@@ -194,8 +179,6 @@ class DiscreteCNNPolicy(nn.Module):
             mlp_hidden_sizes=self.mlp_hidden_sizes,
             activation=self.activation,
             kernel_size=self.kernel_size,
-            use_avgpool=self.use_avgpool,
-            pool_size=self.pool_size,
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
         )
@@ -236,20 +219,20 @@ class DiscreteCNNPolicy(nn.Module):
 
 class CNNVNetwork(nn.Module):
     """
-    Value network with CNN backbone for image observations.
+    Value network with CNN backbone for MinAtar (10x10 images).
 
-    Architecture (pgx MinAtar PPO default):
-    - CNN feature extractor: conv(32, k=2) + avgpool + MLP (64, 64, 64)
-    - Single value output head
+    Architecture:
+    - Conv: 16 filters, 3x3, VALID -> 8x8x16
+    - Flatten -> 1024
+    - MLP: configurable depth (default 4x256 for AdaMO research)
+    - Critic head: 1
     """
-    conv_channels: Sequence[int] = (32,)  # pgx MinAtar default
-    mlp_hidden_sizes: Sequence[int] = (64, 64, 64)  # pgx MinAtar default
+    conv_channels: int = 16  # CleanRL MinAtar default
+    mlp_hidden_sizes: Sequence[int] = (256, 256, 256, 256)  # 4x256 for AdaMO
     activation: Callable = nn.relu
-    kernel_size: int = 2  # pgx MinAtar default
-    use_avgpool: bool = True
-    pool_size: int = 2
+    kernel_size: int = 3
     use_bias: bool = True
-    use_orthogonal_init: bool = False  # pgx doesn't use ortho init
+    use_orthogonal_init: bool = True  # CleanRL uses orthogonal init
 
     @nn.compact
     def __call__(self, obs):
@@ -258,8 +241,6 @@ class CNNVNetwork(nn.Module):
             mlp_hidden_sizes=self.mlp_hidden_sizes,
             activation=self.activation,
             kernel_size=self.kernel_size,
-            use_avgpool=self.use_avgpool,
-            pool_size=self.pool_size,
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
         )(obs)
