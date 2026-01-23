@@ -195,17 +195,18 @@ def create_ppo_config(
     eval_freq: int = 500_000,
     network_type: str = "mlp",
     hidden_layer_sizes: Tuple[int, ...] = (256, 256, 256, 256),
+    mlp_hidden_sizes: Optional[Tuple[int, ...]] = None,  # CNN MLP layers (default 4x256)
 ) -> Dict:
     """Create PPO configuration dict."""
     if network_type == "cnn":
-        # CNN architecture (pgx MinAtar style)
+        # CNN architecture for MinAtar
+        # Conv(16, k=3, VALID) -> Flatten -> MLP (default 4x256 for AdaMO)
+        cnn_mlp_sizes = mlp_hidden_sizes if mlp_hidden_sizes is not None else (256, 256, 256, 256)
         agent_kwargs = {
             "network_type": "cnn",
-            "conv_channels": (32,),
-            "mlp_hidden_sizes": (64, 64, 64),
-            "kernel_size": 2,
-            "use_avgpool": True,
-            "pool_size": 2,
+            "conv_channels": 16,
+            "mlp_hidden_sizes": cnn_mlp_sizes,
+            "kernel_size": 3,
             "activation": activation,
             "use_bias": use_bias,
         }
@@ -307,38 +308,67 @@ EXPERIMENT_CONFIGS_MLP = [
         "final_lr": 1e-6,           # Lyle et al. final LR
         "use_bias": False,
     },
+    {
+        "name": "mlp_adamo_lyle_continual",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "groupsort",
+        "lr_schedule": "lyle_continual",  # Warmup + cosine decay, reset per game
+        "learning_rate": 6.25e-4,         # Peak LR after warmup
+        "warmup_steps": 1000,
+        "final_lr": 1e-6,
+        "use_bias": False,
+    },
 ]
 
-# CNN configs (pgx MinAtar style)
+# CNN configs: conv16-k3-VALID + 4x256 MLP (deeper MLP for AdaMO research)
 # Note: AdaMO with CNN uses ReLU throughout - groupsort not compatible with conv layers
 EXPERIMENT_CONFIGS_CNN = [
     {
         "name": "cnn_baseline",
         "network_type": "cnn",
+        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for fair comparison
         "ortho_mode": None,
         "activation": "relu",
         "lr_schedule": "constant",
-        "learning_rate": 3e-4,  # pgx default
+        "learning_rate": 2.5e-4,  # CleanRL default
         "use_bias": True,
     },
     {
         "name": "cnn_adamo",
         "network_type": "cnn",
+        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for AdaMO
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "relu",  # ReLU for CNN (groupsort incompatible with conv)
         "lr_schedule": "constant",
-        "learning_rate": 3e-4,
+        "learning_rate": 2.5e-4,
         "use_bias": False,
     },
     {
         "name": "cnn_adamo_lyle_lr",
         "network_type": "cnn",
+        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for AdaMO
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "relu",
         "lr_schedule": "linear",
         "learning_rate": 6.25e-5,
+        "final_lr": 1e-6,
+        "use_bias": False,
+    },
+    {
+        "name": "cnn_adamo_lyle_continual",
+        "network_type": "cnn",
+        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for AdaMO
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "relu",
+        "lr_schedule": "lyle_continual",  # Warmup + cosine decay, reset per game
+        "learning_rate": 6.25e-4,         # Peak LR after warmup
+        "warmup_steps": 1000,
         "final_lr": 1e-6,
         "use_bias": False,
     },
@@ -479,6 +509,7 @@ class ContinualTrainer:
             eval_freq=self.eval_freq,
             network_type=self.experiment_config.get("network_type", "mlp"),
             hidden_layer_sizes=self.experiment_config.get("hidden_layer_sizes", (256, 256, 256, 256)),
+            mlp_hidden_sizes=self.experiment_config.get("mlp_hidden_sizes"),  # CNN MLP layers
         )
         return PPO.create(**config)
 
@@ -720,6 +751,7 @@ def create_ppo_for_game_with_config(
         eval_freq=steps_per_game,  # Eval only at end for parallel mode
         network_type=experiment_config.get("network_type", "mlp"),
         hidden_layer_sizes=experiment_config.get("hidden_layer_sizes", (256, 256, 256, 256)),
+        mlp_hidden_sizes=experiment_config.get("mlp_hidden_sizes"),  # CNN MLP layers
     )
     return PPO.create(**config)
 

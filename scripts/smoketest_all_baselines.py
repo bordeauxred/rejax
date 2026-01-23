@@ -38,51 +38,45 @@ GAMES = {
 }
 
 # All baseline configs to test
-# CNN configs need fewer envs due to memory (vmap × envs × conv = OOM)
+# CleanRL MinAtar CNN: conv(16, k=3, VALID) -> flatten -> dense(128)
 CONFIGS = {
-    # CNN baselines FIRST (pgx style) - use 2048 envs to avoid OOM
+    # CNN baselines FIRST (CleanRL MinAtar style)
     "cnn_baseline": {
         "network_type": "cnn",
-        "conv_channels": (32,),
-        "mlp_hidden_sizes": (64, 64, 64),
-        "kernel_size": 2,
-        "use_avgpool": True,
+        "conv_channels": 16,  # CleanRL MinAtar
+        "mlp_hidden_size": 128,  # CleanRL MinAtar
+        "kernel_size": 3,
         "activation": "relu",
-        "use_orthogonal_init": False,
+        "use_orthogonal_init": True,  # CleanRL uses ortho init
         "use_bias": True,
         "ortho_mode": None,
-        "learning_rate": 3e-4,
-        "num_envs": 2048,  # Reduced for CNN memory
+        "learning_rate": 2.5e-4,  # CleanRL default
     },
     "cnn_adamo": {
         "network_type": "cnn",
-        "conv_channels": (32,),
-        "mlp_hidden_sizes": (64, 64, 64),
-        "kernel_size": 2,
-        "use_avgpool": True,
+        "conv_channels": 16,
+        "mlp_hidden_size": 128,
+        "kernel_size": 3,
         "activation": "relu",
-        "use_orthogonal_init": False,
+        "use_orthogonal_init": False,  # AdaMO handles orthogonality
         "use_bias": False,
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
-        "learning_rate": 3e-4,
-        "num_envs": 2048,
+        "learning_rate": 2.5e-4,
     },
     "cnn_adamo_lyle": {
         "network_type": "cnn",
-        "conv_channels": (32,),
-        "mlp_hidden_sizes": (64, 64, 64),
-        "kernel_size": 2,
-        "use_avgpool": True,
+        "conv_channels": 16,
+        "mlp_hidden_size": 128,
+        "kernel_size": 3,
         "activation": "relu",
         "use_orthogonal_init": False,
         "use_bias": False,
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
-        "learning_rate": 6.25e-5,
-        "num_envs": 2048,
+        "learning_rate": 6.25e-5,  # Lyle LR
     },
-    # MLP baselines (4x256, Lyle et al. style) - can use 4096 envs
+    # MLP baselines (4x256, Lyle et al. style)
     # "mlp_baseline": {
     #     "network_type": "mlp",
     #     "hidden_layer_sizes": (256, 256, 256, 256),

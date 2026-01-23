@@ -86,32 +86,31 @@ def create_strong_ppo_config(
     network_type: str = "cnn",
 ) -> Dict:
     """
-    Create PPO config matching pgx MinAtar PPO baseline.
+    Create PPO config matching CleanRL MinAtar baseline.
 
     Key features:
     - network_type: "cnn" (default for MinAtar) or "mlp" (for comparison)
     - adam eps=1e-5 (handled in PPO)
     - clip_by_global_norm (handled in PPO)
 
-    CNN architecture (pgx MinAtar PPO):
-    - Conv: (32,), kernel 2x2, avgpool 2x2
-    - MLP: (64, 64, 64)
-    - Activation: ReLU
+    CNN architecture (CleanRL MinAtar):
+    - Conv: 16 filters, 3x3 kernel, VALID padding -> 8x8x16
+    - Flatten -> 1024
+    - Dense: 128
+    - Activation: ReLU, orthogonal init
 
-    Reference: https://github.com/sotetsuk/pgx/blob/main/examples/minatar-ppo/train.py
-    Expected scores at 20M steps: Asterix ~25, Breakout ~50, Freeway ~60, Seaquest ~60, SpaceInvaders ~150
+    Reference: benchmark/cleanRL/ppo_minatar.py
     """
     if network_type == "cnn":
-        # CNN for image observations (pgx MinAtar PPO style)
+        # CNN for MinAtar (CleanRL style)
+        # Conv(16, k=3, VALID) -> Flatten -> Dense(128)
         agent_kwargs = {
             "network_type": "cnn",
-            "conv_channels": (32,),
-            "mlp_hidden_sizes": (64, 64, 64),
-            "kernel_size": 2,
-            "use_avgpool": True,
-            "pool_size": 2,
+            "conv_channels": 16,
+            "mlp_hidden_sizes": (128,),  # Single layer for CleanRL baseline
+            "kernel_size": 3,
             "activation": "relu",
-            "use_orthogonal_init": False,  # pgx doesn't use orthogonal init
+            "use_orthogonal_init": True,
         }
     else:
         # MLP for comparison (flattened obs)
@@ -126,16 +125,16 @@ def create_strong_ppo_config(
         "env": env,
         "env_params": env_params,
         "agent_kwargs": agent_kwargs,
-        # pgx MinAtar PPO hyperparameters
+        # CleanRL MinAtar PPO hyperparameters
         "num_envs": num_envs,
         "num_steps": 128,
-        "num_epochs": 3,  # pgx uses 3
-        "num_minibatches": 1,  # pgx: minibatch_size=4096, same as num_envs
-        "learning_rate": 3e-4,  # pgx default
-        "anneal_lr": False,  # pgx doesn't anneal
+        "num_epochs": 4,  # CleanRL default
+        "num_minibatches": 4,  # CleanRL default
+        "learning_rate": 2.5e-4,  # CleanRL default
+        "anneal_lr": True,  # CleanRL default
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "clip_eps": 0.2,
+        "clip_eps": 0.1,  # CleanRL MinAtar uses 0.1
         "ent_coef": 0.01,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
@@ -567,9 +566,9 @@ def main():
     print(f"Network: {args.network_type}")
     print("=" * 70)
     if args.network_type == "cnn":
-        print("Config: pgx-style CNN (conv32-k2 + avgpool + mlp64x3), lr=3e-4, epochs=3")
+        print("Config: CleanRL CNN (conv16-k3-VALID + dense128), lr=2.5e-4, epochs=4")
     else:
-        print("Config: MLP (64,64), lr=3e-4, epochs=3")
+        print("Config: MLP (64,64), lr=2.5e-4, epochs=4")
     print("=" * 70)
 
     results = run_all_games(
