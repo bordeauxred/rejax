@@ -55,6 +55,8 @@ uv run python scripts/bench_continual.py \
     --configs mlp_baseline mlp_adamo mlp_adamo_lyle_continual \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --output-dir "$OUTPUT_DIR" \
+    --use-wandb \
+    --wandb-project "rejax-continual" \
     2>&1 | tee -a "$OUTPUT_DIR/run.log"
 
 echo ""
