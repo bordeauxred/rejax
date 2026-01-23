@@ -41,6 +41,30 @@ from minatar_seaquest_fixed import MinSeaquestFixed
 from rejax import PPO
 
 
+def print_update_diagnostics(config: dict, total_timesteps: int):
+    """Print update ratio diagnostics to verify gradient steps are in target range."""
+    num_envs = config.get("num_envs", 2048)
+    num_steps = config.get("num_steps", 128)
+    num_epochs = config.get("num_epochs", 4)
+    num_minibatches = config.get("num_minibatches", 4)
+
+    B = num_envs * num_steps
+    num_updates = total_timesteps // B
+    grad_steps_per_update = num_epochs * num_minibatches
+    total_grad_steps = num_updates * grad_steps_per_update
+
+    print(f"  Update diagnostics:")
+    print(f"    B (batch_size) = {B:,}")
+    print(f"    num_updates = {num_updates:,}")
+    print(f"    grad_steps/update = {grad_steps_per_update}")
+    print(f"    total_grad_steps = {total_grad_steps:,}")
+    print(f"    Target range: 10k-50k (Pgx baseline: ~14.6k)")
+    if total_grad_steps < 10_000:
+        print(f"    WARNING: total_grad_steps ({total_grad_steps:,}) is below target range!")
+    elif total_grad_steps > 50_000:
+        print(f"    WARNING: total_grad_steps ({total_grad_steps:,}) is above target range!")
+
+
 # MinAtar game configurations
 # Note: Seaquest uses fixed implementation adapted from pgx-minatar (gymnax version is broken)
 MINATAR_GAMES = {
@@ -191,24 +215,31 @@ def create_ppo_config(
     final_lr: float = 1e-6,
     warmup_steps: int = 1000,
     use_bias: bool = True,
+    use_orthogonal_init: bool = True,  # Important for PPO stability
     num_envs: int = 2048,
+    num_steps: int = 128,
+    num_epochs: int = 4,
+    num_minibatches: int = 4,
     eval_freq: int = 500_000,
     network_type: str = "mlp",
     hidden_layer_sizes: Tuple[int, ...] = (256, 256, 256, 256),
     mlp_hidden_sizes: Optional[Tuple[int, ...]] = None,  # CNN MLP layers (default 4x256)
+    conv_channels: int = 16,
+    anneal_lr: bool = False,
 ) -> Dict:
     """Create PPO configuration dict."""
     if network_type == "cnn":
         # CNN architecture for MinAtar
-        # Conv(16, k=3, VALID) -> Flatten -> MLP (default 4x256 for AdaMO)
-        cnn_mlp_sizes = mlp_hidden_sizes if mlp_hidden_sizes is not None else (256, 256, 256, 256)
+        # Conv(N, k=3, VALID) -> Flatten -> MLP
+        cnn_mlp_sizes = mlp_hidden_sizes if mlp_hidden_sizes is not None else (64, 64)  # PGX default
         agent_kwargs = {
             "network_type": "cnn",
-            "conv_channels": 16,
+            "conv_channels": conv_channels,
             "mlp_hidden_sizes": cnn_mlp_sizes,
             "kernel_size": 3,
             "activation": activation,
             "use_bias": use_bias,
+            "use_orthogonal_init": use_orthogonal_init,
         }
     else:
         # MLP architecture (configurable, default: 4x256 per Lyle et al.)
@@ -217,6 +248,7 @@ def create_ppo_config(
             "hidden_layer_sizes": hidden_layer_sizes,
             "activation": activation,
             "use_bias": use_bias,
+            "use_orthogonal_init": use_orthogonal_init,
         }
 
     config = {
@@ -224,10 +256,11 @@ def create_ppo_config(
         "env_params": env_params,
         "agent_kwargs": agent_kwargs,
         "num_envs": num_envs,
-        "num_steps": 128,
-        "num_epochs": 4,
-        "num_minibatches": 4,
+        "num_steps": num_steps,
+        "num_epochs": num_epochs,
+        "num_minibatches": num_minibatches,
         "learning_rate": learning_rate,
+        "anneal_lr": anneal_lr,
         "gamma": 0.99,
         "gae_lambda": 0.95,
         "clip_eps": 0.2,
@@ -246,17 +279,18 @@ def create_ppo_config(
     # Handle Lyle continual learning schedule
     if lr_schedule == "lyle_continual":
         # Calculate total gradient steps per game
-        num_steps_per_iter = 128  # PPO num_steps (rollout length)
-        num_epochs = 4   # PPO num_epochs
-        num_minibatches = 4  # PPO num_minibatches
-        iteration_steps = num_envs * num_steps_per_iter
+        iteration_steps = num_envs * num_steps
         num_iterations = max(1, total_timesteps // iteration_steps)
         total_grad_steps = num_iterations * num_epochs * num_minibatches
+
+        # Adjust warmup to be proportional (max 10% of total, or specified warmup)
+        effective_warmup = min(warmup_steps, max(1, total_grad_steps // 10))
+        print(f"  LyleLR schedule: {total_grad_steps} grad steps, {effective_warmup} warmup steps")
 
         config["lr_schedule_fn"] = create_lyle_continual_schedule(
             peak_lr=learning_rate,
             final_lr=final_lr,
-            warmup_steps=warmup_steps,
+            warmup_steps=effective_warmup,
             total_steps=total_grad_steps,
         )
 
@@ -273,17 +307,60 @@ def create_ppo_config(
 # - GroupSort: Only for MLP layers, designed for FC networks (1-Lipschitz)
 # - ReLU: Standard for CNNs, groupsort doesn't work well with conv layers
 #
+# =============================================================================
+# PGX-matched configs (proven to work on MinAtar)
+# Key differences: num_minibatches=128 gives ~24x more gradient steps
+# =============================================================================
+EXPERIMENT_CONFIGS_PGX = [
+    {
+        "name": "pgx_cnn_baseline",
+        "network_type": "cnn",
+        "conv_channels": 32,              # PGX: Conv(32, k=2)
+        "mlp_hidden_sizes": (64, 64),     # PGX: 2x64 MLP
+        "ortho_mode": None,
+        "activation": "relu",             # ReLU for MinAtar
+        "lr_schedule": "constant",
+        "learning_rate": 3e-4,            # PGX: 0.0003
+        "num_epochs": 3,                  # PGX: 3
+        "num_minibatches": 128,           # PGX: minibatch_size=4096 -> 128 minibatches
+        "anneal_lr": True,                # Important for stability
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    {
+        "name": "pgx_cnn_adamo",
+        "network_type": "cnn",
+        "conv_channels": 32,
+        "mlp_hidden_sizes": (64, 64),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "relu",             # ReLU for CNN (groupsort incompatible)
+        "lr_schedule": "constant",
+        "learning_rate": 3e-4,
+        "num_epochs": 3,
+        "num_minibatches": 128,
+        "anneal_lr": True,
+        "use_bias": False,
+        "use_orthogonal_init": True,
+    },
+]
+
+# =============================================================================
 # MLP configs (Lyle et al. style with 4x256 layers for plasticity research)
+# =============================================================================
 EXPERIMENT_CONFIGS_MLP = [
     {
         "name": "mlp_baseline",
         "network_type": "mlp",
         "hidden_layer_sizes": (256, 256, 256, 256),  # 4 layers per Lyle et al.
         "ortho_mode": None,
-        "activation": "tanh",
+        "activation": "relu",             # ReLU for MinAtar
         "lr_schedule": "constant",
         "learning_rate": 2.5e-4,
+        "num_minibatches": 128,           # High for more grad steps
+        "anneal_lr": True,
         "use_bias": True,
+        "use_orthogonal_init": True,
     },
     {
         "name": "mlp_adamo",
@@ -294,7 +371,10 @@ EXPERIMENT_CONFIGS_MLP = [
         "activation": "groupsort",  # 1-Lipschitz activation for ortho networks
         "lr_schedule": "constant",
         "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "anneal_lr": True,
         "use_bias": False,  # Disable bias for ortho experiments
+        "use_orthogonal_init": True,
     },
     {
         "name": "mlp_adamo_lyle_lr",
@@ -306,7 +386,9 @@ EXPERIMENT_CONFIGS_MLP = [
         "lr_schedule": "linear",
         "learning_rate": 6.25e-5,   # Lyle et al. initial LR
         "final_lr": 1e-6,           # Lyle et al. final LR
+        "num_minibatches": 128,
         "use_bias": False,
+        "use_orthogonal_init": True,
     },
     {
         "name": "mlp_adamo_lyle_continual",
@@ -319,74 +401,158 @@ EXPERIMENT_CONFIGS_MLP = [
         "learning_rate": 6.25e-4,         # Peak LR after warmup
         "warmup_steps": 1000,
         "final_lr": 1e-6,
+        "num_minibatches": 128,
         "use_bias": False,
+        "use_orthogonal_init": True,
     },
 ]
 
-# CNN configs: conv16-k3-VALID + 4x256 MLP (deeper MLP for AdaMO research)
+# =============================================================================
+# CNN configs: deeper MLP for AdaMO research (different from PGX baseline)
 # Note: AdaMO with CNN uses ReLU throughout - groupsort not compatible with conv layers
+# =============================================================================
 EXPERIMENT_CONFIGS_CNN = [
     {
         "name": "cnn_baseline",
         "network_type": "cnn",
+        "conv_channels": 32,
         "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for fair comparison
         "ortho_mode": None,
         "activation": "relu",
         "lr_schedule": "constant",
-        "learning_rate": 2.5e-4,  # CleanRL default
+        "learning_rate": 3e-4,
+        "num_minibatches": 128,           # High for more grad steps
+        "anneal_lr": True,
         "use_bias": True,
+        "use_orthogonal_init": True,
     },
     {
         "name": "cnn_adamo",
         "network_type": "cnn",
-        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for AdaMO
+        "conv_channels": 32,
+        "mlp_hidden_sizes": (256, 256, 256, 256),
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
-        "activation": "relu",  # ReLU for CNN (groupsort incompatible with conv)
+        "activation": "relu",
         "lr_schedule": "constant",
-        "learning_rate": 2.5e-4,
+        "learning_rate": 3e-4,
+        "num_minibatches": 128,
+        "anneal_lr": True,
         "use_bias": False,
+        "use_orthogonal_init": True,
     },
     {
         "name": "cnn_adamo_lyle_lr",
         "network_type": "cnn",
-        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for AdaMO
+        "conv_channels": 32,
+        "mlp_hidden_sizes": (256, 256, 256, 256),
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "relu",
         "lr_schedule": "linear",
         "learning_rate": 6.25e-5,
         "final_lr": 1e-6,
+        "num_minibatches": 128,
         "use_bias": False,
+        "use_orthogonal_init": True,
     },
     {
         "name": "cnn_adamo_lyle_continual",
         "network_type": "cnn",
-        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4x256 MLP for AdaMO
+        "conv_channels": 32,
+        "mlp_hidden_sizes": (256, 256, 256, 256),
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "activation": "relu",
-        "lr_schedule": "lyle_continual",  # Warmup + cosine decay, reset per game
-        "learning_rate": 6.25e-4,         # Peak LR after warmup
+        "lr_schedule": "lyle_continual",
+        "learning_rate": 6.25e-4,
         "warmup_steps": 1000,
         "final_lr": 1e-6,
+        "num_minibatches": 128,
+        "anneal_lr": True,
         "use_bias": False,
+        "use_orthogonal_init": True,
+    },
+]
+
+# =============================================================================
+# Recommended Baseline Configs (fixes update ratio for proper learning)
+# Key insight: num_minibatches controls gradient steps per data collection
+# Target range for MinAtar PPO: total_grad_steps ~ 10k-50k at 20M frames
+# =============================================================================
+EXPERIMENT_CONFIGS_BASELINE = [
+    # Config A: Pgx-style (Maximum throughput, matches published results)
+    # For 20M: B=524k, updates≈38, grad_steps/update=384, total≈14.6k
+    {
+        "name": "pgx_baseline",
+        "network_type": "cnn",
+        "conv_channels": 32,
+        "mlp_hidden_sizes": (256, 256, 256, 256),  # 4-layer head for plasticity research
+        "ortho_mode": None,
+        "activation": "relu",
+        "use_orthogonal_init": True,  # Important for PPO stability
+        "learning_rate": 3e-4,
+        "num_envs": 4096,
+        "num_steps": 128,
+        "num_epochs": 3,
+        "num_minibatches": 128,  # minibatch_size=4096
+        "anneal_lr": True,
+        "use_bias": True,
+    },
+    # Config B: Stable/Debuggable (More policy updates, easier to track learning)
+    # For 20M: B=65k, updates≈305, grad_steps/update=128, total≈39k
+    {
+        "name": "stable_baseline",
+        "network_type": "cnn",
+        "conv_channels": 32,
+        "mlp_hidden_sizes": (256, 256, 256, 256),
+        "ortho_mode": None,
+        "activation": "relu",
+        "use_orthogonal_init": True,
+        "learning_rate": 2.5e-4,
+        "num_envs": 512,
+        "num_steps": 128,
+        "num_epochs": 4,
+        "num_minibatches": 32,  # minibatch_size=2048
+        "anneal_lr": True,
+        "use_bias": True,
+    },
+    # Config C: Fast + Stable (Good throughput without fragility)
+    # For 20M: B=262k, updates≈76, grad_steps/update=512, total≈39k
+    {
+        "name": "fast_stable_baseline",
+        "network_type": "cnn",
+        "conv_channels": 32,
+        "mlp_hidden_sizes": (256, 256, 256, 256),
+        "ortho_mode": None,
+        "activation": "relu",
+        "use_orthogonal_init": True,
+        "learning_rate": 3e-4,
+        "num_envs": 2048,
+        "num_steps": 128,
+        "num_epochs": 4,
+        "num_minibatches": 128,  # minibatch_size=2048
+        "anneal_lr": True,
+        "use_bias": True,
     },
 ]
 
 # Combined for backward compatibility
-EXPERIMENT_CONFIGS = EXPERIMENT_CONFIGS_MLP + EXPERIMENT_CONFIGS_CNN
+EXPERIMENT_CONFIGS = EXPERIMENT_CONFIGS_PGX + EXPERIMENT_CONFIGS_MLP + EXPERIMENT_CONFIGS_CNN + EXPERIMENT_CONFIGS_BASELINE
 
-# Legacy aliases
+# Legacy aliases (kept for backward compatibility, updated with proper settings)
 EXPERIMENT_CONFIGS_LEGACY = [
     {
         "name": "baseline",
         "network_type": "mlp",
         "ortho_mode": None,
-        "activation": "tanh",
+        "activation": "relu",
         "lr_schedule": "constant",
         "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "anneal_lr": True,
         "use_bias": True,
+        "use_orthogonal_init": True,
     },
     {
         "name": "ortho_adamo",
@@ -396,7 +562,10 @@ EXPERIMENT_CONFIGS_LEGACY = [
         "activation": "groupsort",
         "lr_schedule": "constant",
         "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "anneal_lr": True,
         "use_bias": False,
+        "use_orthogonal_init": True,
     },
     {
         "name": "ortho_adamo_lyle_lr",
@@ -407,7 +576,9 @@ EXPERIMENT_CONFIGS_LEGACY = [
         "lr_schedule": "linear",
         "learning_rate": 6.25e-5,
         "final_lr": 1e-6,
+        "num_minibatches": 128,
         "use_bias": False,
+        "use_orthogonal_init": True,
     },
     {
         "name": "ortho_adamo_lyle_continual",
@@ -420,7 +591,9 @@ EXPERIMENT_CONFIGS_LEGACY = [
         "learning_rate": 6.25e-4,         # Peak LR (Rainbow default)
         "warmup_steps": 1000,
         "final_lr": 1e-6,
+        "num_minibatches": 128,
         "use_bias": False,
+        "use_orthogonal_init": True,
     },
 ]
 
@@ -492,6 +665,8 @@ class ContinualTrainer:
     def _create_ppo_for_game(self, game_name: str) -> PPO:
         """Create PPO instance configured for a specific game."""
         env, env_params = create_padded_env(game_name)
+        # Use config's num_envs if specified, otherwise fall back to constructor param
+        effective_num_envs = self.experiment_config.get("num_envs", self.num_envs)
         config = create_ppo_config(
             env=env,
             env_params=env_params,
@@ -505,11 +680,17 @@ class ContinualTrainer:
             final_lr=self.experiment_config.get("final_lr", 1e-6),
             warmup_steps=self.experiment_config.get("warmup_steps", 1000),
             use_bias=self.experiment_config.get("use_bias", True),
-            num_envs=self.num_envs,
+            use_orthogonal_init=self.experiment_config.get("use_orthogonal_init", True),
+            num_envs=effective_num_envs,
+            num_steps=self.experiment_config.get("num_steps", 128),
+            num_epochs=self.experiment_config.get("num_epochs", 4),
+            num_minibatches=self.experiment_config.get("num_minibatches", 4),
             eval_freq=self.eval_freq,
             network_type=self.experiment_config.get("network_type", "mlp"),
             hidden_layer_sizes=self.experiment_config.get("hidden_layer_sizes", (256, 256, 256, 256)),
-            mlp_hidden_sizes=self.experiment_config.get("mlp_hidden_sizes"),  # CNN MLP layers
+            mlp_hidden_sizes=self.experiment_config.get("mlp_hidden_sizes"),
+            conv_channels=self.experiment_config.get("conv_channels", 32),
+            anneal_lr=self.experiment_config.get("anneal_lr", False),
         )
         return PPO.create(**config)
 
@@ -585,11 +766,6 @@ class ContinualTrainer:
         """Train on a single game, optionally continuing from existing train_state."""
         ppo = self._create_ppo_for_game(game_name)
 
-        # Add progress callback (wrap the original eval_callback)
-        original_eval_callback = ppo.eval_callback
-        progress_callback = self._make_progress_callback(game_name, cycle_idx, original_eval_callback)
-        ppo = ppo.replace(eval_callback=progress_callback)
-
         if train_state is not None:
             # Transfer weights from previous game
             rng, init_rng = jax.random.split(rng)
@@ -600,7 +776,7 @@ class ContinualTrainer:
             train_state = ppo.init_state(init_rng)
 
         # Train
-        print(f"  Training on {game_name}...")
+        print(f"  Training on {game_name}...", flush=True)
         start_time = time.time()
 
         # Use train_iteration manually to allow step-by-step control
@@ -614,16 +790,43 @@ class ContinualTrainer:
                 return ppo.train_iteration(ts)
             return jax.lax.fori_loop(0, num_iters, body, ts)
 
+        # Compile on first call
+        print(f"    Compiling...", flush=True)
+        compile_start = time.time()
+
         # Run training in chunks with periodic evaluation
         total_iters = 0
+        first_chunk = True
         while total_iters < num_iterations:
             chunk_size = min(eval_interval, num_iterations - total_iters)
             train_state = train_chunk(train_state, chunk_size)
             jax.block_until_ready(train_state)
 
+            if first_chunk:
+                compile_time = time.time() - compile_start
+                print(f"    Compiled in {compile_time:.1f}s", flush=True)
+                first_chunk = False
+
             # Evaluation
             rng, eval_rng = jax.random.split(rng)
             lengths, returns = ppo.eval_callback(ppo, train_state, eval_rng)
+
+            # Progress
+            current_steps = (total_iters + chunk_size) * iteration_steps
+            elapsed = time.time() - start_time
+            steps_per_sec = current_steps / elapsed if elapsed > 0 else 0
+            mean_return = float(returns.mean())
+            pct = 100 * current_steps / self.steps_per_game
+            print(f"    [{game_name}] {current_steps:,}/{self.steps_per_game:,} ({pct:.0f}%) "
+                  f"| return={mean_return:.1f} | {steps_per_sec:,.0f} steps/s", flush=True)
+
+            if self.use_wandb:
+                import wandb
+                wandb.log({
+                    f"train/{game_name}/return": mean_return,
+                    f"train/{game_name}/step": current_steps,
+                    "cycle": cycle_idx,
+                })
 
             total_iters += chunk_size
 
@@ -636,7 +839,7 @@ class ContinualTrainer:
         final_return = float(returns.mean())
 
         print(f"  Completed {game_name}: final_return={final_return:.1f}, "
-              f"elapsed={elapsed:.1f}s, {steps_per_sec:,.0f} steps/s")
+              f"elapsed={elapsed:.1f}s, {steps_per_sec:,.0f} steps/s", flush=True)
 
         return train_state, rng, {
             "game": game_name,
@@ -670,15 +873,19 @@ class ContinualTrainer:
         """Run the full continual learning experiment."""
         train_state = initial_train_state
 
+        # Print update diagnostics at start
+        print(f"\nConfig: {self.config_name}")
+        print_update_diagnostics(self.experiment_config, self.steps_per_game)
+
         for cycle_idx in range(start_cycle, self.num_cycles):
-            print(f"\n{'='*60}")
-            print(f"Cycle {cycle_idx + 1}/{self.num_cycles}")
-            print(f"{'='*60}")
+            print(f"\n{'='*60}", flush=True)
+            print(f"Cycle {cycle_idx + 1}/{self.num_cycles}", flush=True)
+            print(f"{'='*60}", flush=True)
 
             game_start = start_game if cycle_idx == start_cycle else 0
 
             for game_idx, game_name in enumerate(GAME_ORDER[game_start:], start=game_start):
-                print(f"\nGame {game_idx + 1}/{len(GAME_ORDER)}: {game_name}")
+                print(f"\nGame {game_idx + 1}/{len(GAME_ORDER)}: {game_name}", flush=True)
 
                 # Train on this game
                 train_state, rng, game_result = self.train_single_game(
@@ -734,6 +941,8 @@ def create_ppo_for_game_with_config(
 ) -> PPO:
     """Create PPO instance for a game with the given experiment config."""
     env, env_params = create_padded_env(game_name)
+    # Use config's num_envs if specified, otherwise fall back to function param
+    effective_num_envs = experiment_config.get("num_envs", num_envs)
     config = create_ppo_config(
         env=env,
         env_params=env_params,
@@ -747,11 +956,17 @@ def create_ppo_for_game_with_config(
         final_lr=experiment_config.get("final_lr", 1e-6),
         warmup_steps=experiment_config.get("warmup_steps", 1000),
         use_bias=experiment_config.get("use_bias", True),
-        num_envs=num_envs,
+        use_orthogonal_init=experiment_config.get("use_orthogonal_init", True),
+        num_envs=effective_num_envs,
+        num_steps=experiment_config.get("num_steps", 128),
+        num_epochs=experiment_config.get("num_epochs", 4),
+        num_minibatches=experiment_config.get("num_minibatches", 4),
         eval_freq=steps_per_game,  # Eval only at end for parallel mode
         network_type=experiment_config.get("network_type", "mlp"),
         hidden_layer_sizes=experiment_config.get("hidden_layer_sizes", (256, 256, 256, 256)),
-        mlp_hidden_sizes=experiment_config.get("mlp_hidden_sizes"),  # CNN MLP layers
+        mlp_hidden_sizes=experiment_config.get("mlp_hidden_sizes"),
+        conv_channels=experiment_config.get("conv_channels", 32),
+        anneal_lr=experiment_config.get("anneal_lr", False),
     )
     return PPO.create(**config)
 
@@ -775,6 +990,9 @@ def run_experiment_parallel(
     print(f"# Experiment (PARALLEL): {config_name}")
     print(f"# Seeds: {num_seeds}, Steps per game: {steps_per_game:,}, Cycles: {num_cycles}")
     print(f"{'#'*70}")
+
+    # Print update diagnostics
+    print_update_diagnostics(experiment_config, steps_per_game)
 
     # Create PPO instances for all games (same config, different envs)
     ppos = [create_ppo_for_game_with_config(game, experiment_config, steps_per_game, num_envs)
@@ -1048,7 +1266,7 @@ def main():
                         help="Number of random seeds")
     parser.add_argument("--num-envs", type=int, default=2048,
                         help="Parallel environments")
-    parser.add_argument("--eval-freq", type=int, default=500_000,
+    parser.add_argument("--eval-freq", type=int, default=250_000,
                         help="Evaluation frequency in steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/continual",
                         help="Directory for checkpoints")
@@ -1067,7 +1285,7 @@ def main():
     # Get all config names
     all_config_names = [c["name"] for c in EXPERIMENT_CONFIGS] + [c["name"] for c in EXPERIMENT_CONFIGS_LEGACY]
     parser.add_argument("--configs", nargs="+",
-                        default=["mlp_baseline", "cnn_baseline"],
+                        default=["pgx_baseline"],  # Recommended main baseline
                         choices=all_config_names,
                         help="Experiment configurations to run")
     parser.add_argument("--parallel-seeds", action="store_true",
@@ -1106,15 +1324,15 @@ def main():
         # Sequential execution: run all configs for each seed before moving to next seed
         # This allows comparing configs at the same seed more easily
         for seed_idx in range(args.num_seeds):
-            print(f"\n{'='*70}")
-            print(f"SEED {seed_idx + 1}/{args.num_seeds}")
-            print(f"{'='*70}")
+            print(f"\n{'='*70}", flush=True)
+            print(f"SEED {seed_idx + 1}/{args.num_seeds}", flush=True)
+            print(f"{'='*70}", flush=True)
 
             for experiment_config in configs_to_run:
                 config_name = experiment_config["name"]
-                print(f"\n{'#'*60}")
-                print(f"# Config: {config_name} | Seed: {seed_idx}")
-                print(f"{'#'*60}")
+                print(f"\n{'#'*60}", flush=True)
+                print(f"# Config: {config_name} | Seed: {seed_idx}", flush=True)
+                print(f"{'#'*60}", flush=True)
 
                 rng = jax.random.PRNGKey(args.seed + seed_idx)
 

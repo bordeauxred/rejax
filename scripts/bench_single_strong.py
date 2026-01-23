@@ -42,7 +42,11 @@ from gymnax.environments.minatar.asterix import MinAsterix
 from gymnax.environments.minatar.space_invaders import MinSpaceInvaders
 from gymnax.environments.minatar.freeway import MinFreeway
 from minatar_seaquest_fixed import MinSeaquestFixed
-from bench_continual import create_padded_env, UNIFIED_CHANNELS, UNIFIED_ACTIONS
+from bench_continual import (
+    create_padded_env, UNIFIED_CHANNELS, UNIFIED_ACTIONS,
+    EXPERIMENT_CONFIGS_BASELINE, EXPERIMENT_CONFIGS, EXPERIMENT_CONFIGS_LEGACY,
+    print_update_diagnostics,
+)
 
 
 # MinAtar game configurations (native, not padded for single-task)
@@ -75,6 +79,73 @@ def create_env(game_name: str, padded: bool = False) -> Tuple[Any, Any]:
     if padded:
         return create_padded_env(game_name)
     return create_native_env(game_name)
+
+
+def get_experiment_config(config_name: str) -> Dict:
+    """Get experiment config by name from bench_continual configs."""
+    all_configs = EXPERIMENT_CONFIGS + EXPERIMENT_CONFIGS_LEGACY
+    for c in all_configs:
+        if c["name"] == config_name:
+            return c
+    raise ValueError(f"Unknown config: {config_name}. Available: {[c['name'] for c in all_configs]}")
+
+
+def create_ppo_config_from_experiment(
+    env,
+    env_params,
+    experiment_config: Dict,
+    total_timesteps: int,
+    eval_freq: int = 100_000,
+    num_envs_override: Optional[int] = None,
+) -> Dict:
+    """
+    Create PPO config from an experiment config (from bench_continual.py).
+
+    This uses the same hyperparameters as the continual learning experiments
+    to validate single-task performance before running continual.
+    """
+    network_type = experiment_config.get("network_type", "cnn")
+    num_envs = num_envs_override or experiment_config.get("num_envs", 2048)
+
+    if network_type == "cnn":
+        agent_kwargs = {
+            "network_type": "cnn",
+            "conv_channels": experiment_config.get("conv_channels", 32),
+            "mlp_hidden_sizes": experiment_config.get("mlp_hidden_sizes", (256, 256, 256, 256)),
+            "kernel_size": 3,
+            "activation": experiment_config.get("activation", "relu"),
+            "use_orthogonal_init": experiment_config.get("use_orthogonal_init", True),
+            "use_bias": experiment_config.get("use_bias", True),
+        }
+    else:
+        agent_kwargs = {
+            "network_type": "mlp",
+            "hidden_layer_sizes": experiment_config.get("hidden_layer_sizes", (256, 256, 256, 256)),
+            "activation": experiment_config.get("activation", "relu"),
+            "use_orthogonal_init": experiment_config.get("use_orthogonal_init", True),
+            "use_bias": experiment_config.get("use_bias", True),
+        }
+
+    return {
+        "env": env,
+        "env_params": env_params,
+        "agent_kwargs": agent_kwargs,
+        "num_envs": num_envs,
+        "num_steps": experiment_config.get("num_steps", 128),
+        "num_epochs": experiment_config.get("num_epochs", 4),
+        "num_minibatches": experiment_config.get("num_minibatches", 128),
+        "learning_rate": experiment_config.get("learning_rate", 3e-4),
+        "anneal_lr": experiment_config.get("anneal_lr", True),
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_eps": 0.2,
+        "ent_coef": 0.01,
+        "vf_coef": 0.5,
+        "max_grad_norm": 0.5,
+        "total_timesteps": total_timesteps,
+        "eval_freq": eval_freq,
+        "skip_initial_evaluation": False,
+    }
 
 
 def create_strong_ppo_config(
@@ -231,32 +302,47 @@ def benchmark_single_game(
     wandb_run = None,
     padded: bool = False,
     network_type: str = "cnn",
+    experiment_config: Optional[Dict] = None,
 ) -> GameResult:
     """Benchmark a single game and collect learning curves."""
     mode_str = "PADDED" if padded else "NATIVE"
+    config_name = experiment_config["name"] if experiment_config else network_type.upper()
     print(f"\n{'='*70}")
-    print(f"Game: {game_name} ({mode_str}, {network_type.upper()})")
+    print(f"Game: {game_name} ({mode_str}, {config_name})")
     print(f"{'='*70}")
 
     # Create environment
     env, env_params = create_env(game_name, padded=padded)
 
-    # Create strong PPO config
-    config = create_strong_ppo_config(
-        env=env,
-        env_params=env_params,
-        total_timesteps=total_timesteps,
-        eval_freq=eval_freq,
-        num_envs=num_envs,
-        network_type=network_type,
-    )
+    # Create PPO config - use experiment config if provided
+    if experiment_config:
+        config = create_ppo_config_from_experiment(
+            env=env,
+            env_params=env_params,
+            experiment_config=experiment_config,
+            total_timesteps=total_timesteps,
+            eval_freq=eval_freq,
+            num_envs_override=num_envs if num_envs != 2048 else None,  # Only override if explicitly set
+        )
+        # Print update diagnostics
+        print_update_diagnostics(experiment_config, total_timesteps)
+    else:
+        config = create_strong_ppo_config(
+            env=env,
+            env_params=env_params,
+            total_timesteps=total_timesteps,
+            eval_freq=eval_freq,
+            num_envs=num_envs,
+            network_type=network_type,
+        )
 
     ppo = PPO.create(**config)
 
     # Print config summary
     print(f"  Config: anneal_lr={ppo.anneal_lr}, clip_eps={ppo.clip_eps}, "
-          f"lr={ppo.learning_rate}, num_envs={ppo.num_envs}")
-    if network_type == "cnn":
+          f"lr={ppo.learning_rate}, num_envs={ppo.num_envs}, "
+          f"epochs={ppo.num_epochs}, minibatches={ppo.num_minibatches}")
+    if hasattr(ppo.actor, 'conv_channels'):
         print(f"  Network: CNN conv={ppo.actor.conv_channels}, mlp={ppo.actor.mlp_hidden_sizes}, "
               f"ortho_init={ppo.actor.use_orthogonal_init}")
     else:
@@ -353,14 +439,17 @@ def run_all_games(
     wandb_project: str,
     padded: bool = False,
     network_type: str = "cnn",
+    experiment_config: Optional[Dict] = None,
 ) -> Dict:
     """Run benchmark on all specified games."""
     mode_str = "padded" if padded else "native"
+    config_name = experiment_config["name"] if experiment_config else network_type
     results = {
-        "experiment": f"strong_single_task_baseline_{mode_str}_{network_type}",
-        "description": f"PPO with {network_type.upper()} + LR annealing + orthogonal init ({mode_str} envs)",
+        "experiment": f"single_task_{config_name}_{mode_str}",
+        "description": f"PPO with {config_name} config ({mode_str} envs)",
         "padded": padded,
-        "network_type": network_type,
+        "config_name": config_name,
+        "experiment_config": experiment_config,
         "total_timesteps": total_timesteps,
         "num_seeds": num_seeds,
         "num_envs": num_envs,
@@ -374,20 +463,17 @@ def run_all_games(
         import wandb
         wandb_run = wandb.init(
             project=wandb_project,
-            name=f"strong_baseline_{mode_str}_{network_type}_{time.strftime('%Y%m%d_%H%M%S')}",
+            name=f"single_{config_name}_{mode_str}_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
-                "experiment": f"strong_single_task_baseline_{mode_str}_{network_type}",
+                "experiment": f"single_task_{config_name}_{mode_str}",
                 "padded": padded,
-                "network_type": network_type,
+                "config_name": config_name,
+                "experiment_config": experiment_config,
                 "total_timesteps": total_timesteps,
                 "num_seeds": num_seeds,
                 "num_envs": num_envs,
                 "eval_freq": eval_freq,
                 "games": games,
-                "anneal_lr": True,
-                "use_orthogonal_init": True,
-                "clip_eps": 0.2,
-                "learning_rate": 2.5e-4,
             },
         )
 
@@ -402,6 +488,7 @@ def run_all_games(
             wandb_run=wandb_run,
             padded=padded,
             network_type=network_type,
+            experiment_config=experiment_config,
         )
         results["per_game_results"].append(game_result.to_dict())
 
@@ -502,8 +589,12 @@ def plot_learning_curves(results: Dict, output_dir: Path):
 
 
 def main():
+    # Get all available config names
+    all_configs = EXPERIMENT_CONFIGS + EXPERIMENT_CONFIGS_LEGACY
+    all_config_names = [c["name"] for c in all_configs]
+
     parser = argparse.ArgumentParser(
-        description="Strong single-task MinAtar baseline (PureJaxRL-matching)"
+        description="Single-task MinAtar baseline for validating configs before continual learning"
     )
     parser.add_argument(
         "--games", nargs="+", default=GAME_ORDER,
@@ -511,20 +602,29 @@ def main():
     )
     parser.add_argument(
         "--timesteps", type=int, default=10_000_000,
-        help="Training timesteps per game (PureJaxRL default: 10M)"
+        help="Training timesteps per game (default: 10M, pgx uses 20M)"
     )
     parser.add_argument(
-        "--num-seeds", type=int, default=5,
+        "--num-seeds", type=int, default=3,
         help="Number of seeds per game"
     )
     parser.add_argument(
-        "--num-envs", type=int, default=4096,
-        help="Parallel environments (pgx default: 4096)"
+        "--num-envs", type=int, default=2048,
+        help="Parallel environments (override config default)"
+    )
+    parser.add_argument(
+        "--config", type=str, default="pgx_baseline",
+        choices=all_config_names,
+        help="Experiment config from bench_continual.py (recommended: pgx_baseline, mlp_baseline)"
     )
     parser.add_argument(
         "--network-type", type=str, default="cnn",
         choices=["cnn", "mlp"],
-        help="Network type: 'cnn' (pgx style) or 'mlp' (flattened obs)"
+        help="Network type (only used if --config is not specified)"
+    )
+    parser.add_argument(
+        "--legacy-mode", action="store_true",
+        help="Use legacy CleanRL config instead of experiment configs"
     )
     parser.add_argument(
         "--eval-freq", type=int, default=100_000,
@@ -532,7 +632,7 @@ def main():
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
-        help="Directory for results (default: results/strong_baseline_{padded|native})"
+        help="Directory for results"
     )
     parser.add_argument(
         "--use-wandb", action="store_true",
@@ -553,22 +653,30 @@ def main():
 
     args = parser.parse_args()
 
+    # Get experiment config if not in legacy mode
+    experiment_config = None
+    if not args.legacy_mode:
+        experiment_config = get_experiment_config(args.config)
+
     mode_str = "PADDED" if args.padded else "NATIVE"
+    config_name = experiment_config["name"] if experiment_config else args.network_type.upper()
+
     print("=" * 70)
-    print(f"MinAtar PPO Baseline (pgx-matching) - {mode_str} - {args.network_type.upper()}")
+    print(f"MinAtar Single-Task Baseline - {mode_str}")
     print("=" * 70)
+    print(f"Config: {config_name}")
     print(f"Games: {args.games}")
     print(f"Timesteps: {args.timesteps:,}")
     print(f"Seeds: {args.num_seeds}")
-    print(f"Envs: {args.num_envs}")
     print(f"Eval freq: {args.eval_freq:,}")
     print(f"Padded: {args.padded}")
-    print(f"Network: {args.network_type}")
-    print("=" * 70)
-    if args.network_type == "cnn":
-        print("Config: CleanRL CNN (conv16-k3-VALID + dense128), lr=2.5e-4, epochs=4")
-    else:
-        print("Config: MLP (64,64), lr=2.5e-4, epochs=4")
+    if experiment_config:
+        print(f"Network: {experiment_config.get('network_type', 'cnn').upper()}")
+        print(f"num_envs: {experiment_config.get('num_envs', args.num_envs)}")
+        print(f"num_epochs: {experiment_config.get('num_epochs', 4)}")
+        print(f"num_minibatches: {experiment_config.get('num_minibatches', 128)}")
+        print(f"learning_rate: {experiment_config.get('learning_rate', 3e-4)}")
+        print(f"anneal_lr: {experiment_config.get('anneal_lr', True)}")
     print("=" * 70)
 
     results = run_all_games(
@@ -581,14 +689,15 @@ def main():
         wandb_project=args.wandb_project,
         padded=args.padded,
         network_type=args.network_type,
+        experiment_config=experiment_config,
     )
 
-    # Default output dir based on mode
+    # Default output dir based on config
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
         mode_suffix = "padded" if args.padded else "native"
-        output_dir = Path(f"results/strong_baseline_{mode_suffix}")
+        output_dir = Path(f"results/single_task_{config_name}_{mode_suffix}")
 
     save_results(results, output_dir)
     print_summary(results)
