@@ -859,8 +859,7 @@ class ContinualTrainer:
                     "cycle": cycle_idx,
                     "game_idx": game_idx,
                     "game": game_name,
-                    "cumulative_step": cumulative_step,
-                })
+                }, step=cumulative_step)  # Use cumulative_step as x-axis
 
             total_iters += chunk_size
 
