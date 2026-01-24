@@ -6,9 +6,9 @@ set -e
 
 STEPS_PER_GAME=20000000
 NUM_CYCLES=5
-NUM_SEEDS=3
+NUM_SEEDS=2
 EVAL_FREQ=500000
-WANDB_PROJECT="rejax-continual-baselines_improved_ppo"
+WANDB_PROJECT="continual_minatar_improved_ppo"
 
 echo "========================================"
 echo "Continual Learning: Baseline vs AdaMO"
@@ -19,8 +19,18 @@ echo "Seeds: $NUM_SEEDS"
 echo "WandB: $WANDB_PROJECT"
 echo ""
 
+echo ">>> [1/6] cnn_adamo (CNN + AdaMO)..."
+uv run python scripts/bench_continual.py \
+  --configs cnn_adamo \
+  --steps-per-game $STEPS_PER_GAME \
+  --num-cycles $NUM_CYCLES \
+  --num-seeds $NUM_SEEDS \
+  --eval-freq $EVAL_FREQ \
+  --use-wandb \
+  --wandb-project $WANDB_PROJECT
+
 # CNN comparisons (fair: same architecture, same hyperparams)
-echo ">>> [1/6] pgx_baseline (CNN baseline)..."
+echo ">>> [2/6] pgx_baseline (CNN baseline)..."
 uv run python scripts/bench_continual.py \
   --configs pgx_baseline \
   --steps-per-game $STEPS_PER_GAME \
@@ -30,15 +40,6 @@ uv run python scripts/bench_continual.py \
   --use-wandb \
   --wandb-project $WANDB_PROJECT
 
-echo ">>> [2/6] cnn_adamo (CNN + AdaMO)..."
-uv run python scripts/bench_continual.py \
-  --configs cnn_adamo \
-  --steps-per-game $STEPS_PER_GAME \
-  --num-cycles $NUM_CYCLES \
-  --num-seeds $NUM_SEEDS \
-  --eval-freq $EVAL_FREQ \
-  --use-wandb \
-  --wandb-project $WANDB_PROJECT
 
 echo ">>> [3/6] cnn_adamo_lyle_continual (CNN + AdaMO + Lyle schedule)..."
 uv run python scripts/bench_continual.py \
