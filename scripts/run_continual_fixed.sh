@@ -1,6 +1,6 @@
 #!/bin/bash
 # Continual learning experiment with OOM fix
-# Uses continual_pipeline.py instead of bench_continual.py
+# Uses bench_continual.py with cached eval functions
 #
 # Cycles through all 5 MinAtar games without weight resets
 # Compares baseline vs AdaMO vs AdaMO+Lyle
@@ -11,7 +11,7 @@ STEPS_PER_GAME=20000000
 NUM_CYCLES=5
 NUM_SEEDS=2
 EVAL_FREQ=500000
-WANDB_PROJECT="continual_minatar_fixed"
+WANDB_PROJECT="continual_minatar_ppo_long"
 
 echo "=========================================="
 echo "Continual Learning (OOM-Fixed Pipeline)"
@@ -22,11 +22,11 @@ echo "Seeds: $NUM_SEEDS"
 echo "Eval freq: $EVAL_FREQ"
 echo "WandB: $WANDB_PROJECT"
 echo ""
-echo "Using continual_pipeline.py with cached eval (OOM fix)"
+echo "Using bench_continual.py with cached eval (OOM fix)"
 echo ""
 
 echo ">>> [1/6] cnn_adamo (CNN + AdaMO)..."
-uv run python scripts/continual_pipeline.py \
+uv run python scripts/bench_continual.py \
   --configs cnn_adamo \
   --steps-per-game $STEPS_PER_GAME \
   --num-cycles $NUM_CYCLES \
@@ -36,7 +36,7 @@ uv run python scripts/continual_pipeline.py \
   --wandb-project $WANDB_PROJECT
 
 echo ">>> [2/6] pgx_baseline (CNN baseline)..."
-uv run python scripts/continual_pipeline.py \
+uv run python scripts/bench_continual.py \
   --configs pgx_baseline \
   --steps-per-game $STEPS_PER_GAME \
   --num-cycles $NUM_CYCLES \
@@ -46,7 +46,7 @@ uv run python scripts/continual_pipeline.py \
   --wandb-project $WANDB_PROJECT
 
 echo ">>> [3/6] cnn_adamo_lyle_continual (CNN + AdaMO + Lyle schedule)..."
-uv run python scripts/continual_pipeline.py \
+uv run python scripts/bench_continual.py \
   --configs cnn_adamo_lyle_continual \
   --steps-per-game $STEPS_PER_GAME \
   --num-cycles $NUM_CYCLES \
@@ -56,7 +56,7 @@ uv run python scripts/continual_pipeline.py \
   --wandb-project $WANDB_PROJECT
 
 echo ">>> [4/6] mlp_baseline (MLP baseline)..."
-uv run python scripts/continual_pipeline.py \
+uv run python scripts/bench_continual.py \
   --configs mlp_baseline \
   --steps-per-game $STEPS_PER_GAME \
   --num-cycles $NUM_CYCLES \
@@ -66,7 +66,7 @@ uv run python scripts/continual_pipeline.py \
   --wandb-project $WANDB_PROJECT
 
 echo ">>> [5/6] mlp_adamo (MLP + AdaMO + groupsort)..."
-uv run python scripts/continual_pipeline.py \
+uv run python scripts/bench_continual.py \
   --configs mlp_adamo \
   --steps-per-game $STEPS_PER_GAME \
   --num-cycles $NUM_CYCLES \
@@ -76,7 +76,7 @@ uv run python scripts/continual_pipeline.py \
   --wandb-project $WANDB_PROJECT
 
 echo ">>> [6/6] mlp_adamo_lyle_continual (MLP + AdaMO + Lyle schedule)..."
-uv run python scripts/continual_pipeline.py \
+uv run python scripts/bench_continual.py \
   --configs mlp_adamo_lyle_continual \
   --steps-per-game $STEPS_PER_GAME \
   --num-cycles $NUM_CYCLES \
