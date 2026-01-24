@@ -672,10 +672,24 @@ class ContinualTrainer:
         # This keeps only 5 compiled functions in memory (one per game)
         self._ppo_cache = {}
 
-    def _get_ppo_for_game(self, game_name: str) -> PPO:
-        """Get cached PPO instance for a game, creating if needed."""
+    def _get_ppo_for_game(self, game_name: str) -> Tuple[PPO, Any]:
+        """Get cached (PPO, train_chunk) for a game, creating if needed.
+
+        Caches both PPO and its JIT-compiled train_chunk to avoid recompilation
+        across cycles. Without this, each cycle would create new function objects
+        that JAX traces separately, causing OOM after ~14 games.
+        """
         if game_name not in self._ppo_cache:
-            self._ppo_cache[game_name] = self._create_ppo_for_game(game_name)
+            ppo = self._create_ppo_for_game(game_name)
+
+            # Create train_chunk closure that captures this specific ppo
+            @jax.jit
+            def train_chunk(ts, num_iters):
+                def body(_, ts):
+                    return ppo.train_iteration(ts)
+                return jax.lax.fori_loop(0, num_iters, body, ts)
+
+            self._ppo_cache[game_name] = (ppo, train_chunk)
         return self._ppo_cache[game_name]
 
     def _create_ppo_for_game(self, game_name: str) -> PPO:
@@ -780,8 +794,8 @@ class ContinualTrainer:
 
     def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int):
         """Train on a single game, optionally continuing from existing train_state."""
-        # Use cached PPO to avoid recompilation across cycles
-        ppo = self._get_ppo_for_game(game_name)
+        # Use cached PPO and train_chunk to avoid recompilation across cycles
+        ppo, train_chunk = self._get_ppo_for_game(game_name)
 
         if train_state is not None:
             # Transfer weights from previous game
@@ -801,12 +815,7 @@ class ContinualTrainer:
         num_iterations = int(np.ceil(self.steps_per_game / iteration_steps))
         eval_interval = int(np.ceil(self.eval_freq / iteration_steps))
 
-        @jax.jit
-        def train_chunk(ts, num_iters):
-            def body(_, ts):
-                return ppo.train_iteration(ts)
-            return jax.lax.fori_loop(0, num_iters, body, ts)
-
+        # train_chunk is cached with PPO - no recompilation after cycle 0
         # Compile on first call
         print(f"    Compiling...", flush=True)
         compile_start = time.time()
@@ -888,7 +897,7 @@ class ContinualTrainer:
         eval_results = {}
 
         for game_name in GAME_ORDER:
-            ppo = self._get_ppo_for_game(game_name)
+            ppo, _ = self._get_ppo_for_game(game_name)  # Unpack, don't need train_chunk for eval
 
             # Transfer weights to this game's environment
             rng, eval_rng, init_rng = jax.random.split(rng, 3)
