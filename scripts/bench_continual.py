@@ -436,6 +436,9 @@ EXPERIMENT_CONFIGS_CNN = [
         "activation": "relu",
         "lr_schedule": "constant",
         "learning_rate": 3e-4,
+        "num_envs": 4096,             # Match pgx_baseline
+        "num_steps": 128,
+        "num_epochs": 3,              # Match pgx_baseline
         "num_minibatches": 128,
         "anneal_lr": True,
         "use_bias": False,
@@ -467,6 +470,9 @@ EXPERIMENT_CONFIGS_CNN = [
         "lr_schedule": "lyle_continual",
         "learning_rate": 6.25e-4,
         "warmup_steps": 1000,
+        "num_envs": 4096,             # Match pgx_baseline
+        "num_steps": 128,
+        "num_epochs": 3,              # Match pgx_baseline
         "final_lr": 1e-6,
         "num_minibatches": 128,
         "anneal_lr": True,
@@ -822,10 +828,27 @@ class ContinualTrainer:
 
             if self.use_wandb:
                 import wandb
+                # Calculate cumulative step for Lyle-style plots
+                # game_idx is passed from run(), but we need it here
+                game_idx = GAME_ORDER.index(game_name)
+                cumulative_step = (
+                    cycle_idx * len(GAME_ORDER) * self.steps_per_game +  # previous cycles
+                    game_idx * self.steps_per_game +                      # previous games this cycle
+                    current_steps                                          # current game progress
+                )
                 wandb.log({
+                    # Per-game tracking
                     f"train/{game_name}/return": mean_return,
                     f"train/{game_name}/step": current_steps,
+                    # Per-cycle tracking (for Lyle-style plots)
+                    f"cycle_{cycle_idx}/return": mean_return,
+                    f"cycle_{cycle_idx}/game": game_name,
+                    # Global tracking
+                    "return": mean_return,
                     "cycle": cycle_idx,
+                    "game_idx": game_idx,
+                    "game": game_name,
+                    "cumulative_step": cumulative_step,
                 })
 
             total_iters += chunk_size
