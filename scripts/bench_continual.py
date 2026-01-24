@@ -668,6 +668,16 @@ class ContinualTrainer:
             "per_game_results": [],
         }
 
+        # Cache PPO instances per game to avoid recompilation across cycles
+        # This keeps only 5 compiled functions in memory (one per game)
+        self._ppo_cache = {}
+
+    def _get_ppo_for_game(self, game_name: str) -> PPO:
+        """Get cached PPO instance for a game, creating if needed."""
+        if game_name not in self._ppo_cache:
+            self._ppo_cache[game_name] = self._create_ppo_for_game(game_name)
+        return self._ppo_cache[game_name]
+
     def _create_ppo_for_game(self, game_name: str) -> PPO:
         """Create PPO instance configured for a specific game."""
         env, env_params = create_padded_env(game_name)
@@ -770,7 +780,8 @@ class ContinualTrainer:
 
     def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int):
         """Train on a single game, optionally continuing from existing train_state."""
-        ppo = self._create_ppo_for_game(game_name)
+        # Use cached PPO to avoid recompilation across cycles
+        ppo = self._get_ppo_for_game(game_name)
 
         if train_state is not None:
             # Transfer weights from previous game
@@ -878,7 +889,7 @@ class ContinualTrainer:
         eval_results = {}
 
         for game_name in GAME_ORDER:
-            ppo = self._create_ppo_for_game(game_name)
+            ppo = self._get_ppo_for_game(game_name)
 
             # Transfer weights to this game's environment
             rng, eval_rng, init_rng = jax.random.split(rng, 3)
@@ -910,7 +921,7 @@ class ContinualTrainer:
             for game_idx, game_name in enumerate(GAME_ORDER[game_start:], start=game_start):
                 print(f"\nGame {game_idx + 1}/{len(GAME_ORDER)}: {game_name}", flush=True)
 
-                # Train on this game
+                # Train on this game (PPO instances cached to avoid recompilation)
                 train_state, rng, game_result = self.train_single_game(
                     game_name, train_state, rng, cycle_idx
                 )
