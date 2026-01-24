@@ -22,7 +22,7 @@ echo "Old code: 125 eval compilations -> OOM around game 15-19"
 echo "Fixed code: 5 eval compilations (1 per game) -> completes successfully"
 echo ""
 
-uv run python scripts/continual_pipeline.py \
+uv run python scripts/bench_continual.py \
   --configs pgx_baseline \
   --steps-per-game 500000 \
   --num-cycles 5 \

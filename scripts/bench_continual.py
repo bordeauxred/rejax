@@ -41,6 +41,61 @@ from minatar_seaquest_fixed import MinSeaquestFixed
 from rejax import PPO
 
 
+def create_cached_eval_fn(ppo):
+    """Create a cached evaluation function that doesn't recompile on each call.
+
+    The key insight: the act function in evaluate() is marked as static_argnames,
+    so each new act closure triggers recompilation. Instead, we create ONE
+    JIT-compiled function that takes params as a regular pytree argument.
+
+    This reduces eval compilations from ~1000 (40 per game × 25 games) to just 5
+    (one per game, reused across cycles).
+    """
+    env = ppo.env
+    env_params = ppo.env_params
+    actor = ppo.actor
+    max_steps = env_params.max_steps_in_episode
+
+    @jax.jit
+    def cached_eval(actor_params, rng, num_episodes=128):
+        """Evaluate actor with given params (no recompilation)."""
+
+        def eval_episode(rng):
+            """Run single episode, return (length, return)."""
+            rng_reset, rng_ep = jax.random.split(rng)
+            obs, env_state = env.reset(rng_reset, env_params)
+
+            def step_fn(carry, _):
+                obs, env_state, rng, done, ret, length = carry
+                rng, rng_act, rng_step = jax.random.split(rng, 3)
+
+                # Use actor directly with params (not via closure)
+                action = actor.apply(actor_params, jnp.expand_dims(obs, 0),
+                                    rng_act, method="act")
+                action = jnp.squeeze(action)
+
+                next_obs, next_state, reward, next_done, _ = env.step(
+                    rng_step, env_state, action, env_params)
+
+                # Only update if not already done
+                ret = ret + reward * (1 - done)
+                length = length + (1 - done).astype(jnp.int32)
+
+                return (next_obs, next_state, rng, done | next_done, ret, length), None
+
+            init_carry = (obs, env_state, rng_ep, False, 0.0, 0)
+            (_, _, _, _, final_return, final_length), _ = jax.lax.scan(
+                step_fn, init_carry, None, length=max_steps)
+
+            return final_length, final_return
+
+        rngs = jax.random.split(rng, num_episodes)
+        lengths, returns = jax.vmap(eval_episode)(rngs)
+        return lengths, returns
+
+    return cached_eval
+
+
 def print_update_diagnostics(config: dict, total_timesteps: int):
     """Print update ratio diagnostics to verify gradient steps are in target range."""
     num_envs = config.get("num_envs", 2048)
@@ -672,12 +727,16 @@ class ContinualTrainer:
         # This keeps only 5 compiled functions in memory (one per game)
         self._ppo_cache = {}
 
-    def _get_ppo_for_game(self, game_name: str) -> Tuple[PPO, Any]:
-        """Get cached (PPO, train_chunk) for a game, creating if needed.
+    def _get_ppo_for_game(self, game_name: str) -> Tuple[PPO, Any, Any]:
+        """Get cached (PPO, train_chunk, cached_eval) for a game, creating if needed.
 
-        Caches both PPO and its JIT-compiled train_chunk to avoid recompilation
-        across cycles. Without this, each cycle would create new function objects
-        that JAX traces separately, causing OOM after ~14 games.
+        Caches PPO, its JIT-compiled train_chunk, and a cached eval function to avoid
+        recompilation across cycles. Without this, each cycle would create new function
+        objects that JAX traces separately, causing OOM after ~14 games.
+
+        The cached_eval is critical: the standard evaluate() has act as static_argnames,
+        so each new act closure from make_act() triggers recompilation. cached_eval
+        takes actor_params as a pytree argument instead, so it compiles once per game.
         """
         if game_name not in self._ppo_cache:
             ppo = self._create_ppo_for_game(game_name)
@@ -689,7 +748,10 @@ class ContinualTrainer:
                     return ppo.train_iteration(ts)
                 return jax.lax.fori_loop(0, num_iters, body, ts)
 
-            self._ppo_cache[game_name] = (ppo, train_chunk)
+            # Create cached eval function that doesn't recompile on each call
+            cached_eval = create_cached_eval_fn(ppo)
+
+            self._ppo_cache[game_name] = (ppo, train_chunk, cached_eval)
         return self._ppo_cache[game_name]
 
     def _create_ppo_for_game(self, game_name: str) -> PPO:
@@ -794,8 +856,8 @@ class ContinualTrainer:
 
     def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int):
         """Train on a single game, optionally continuing from existing train_state."""
-        # Use cached PPO and train_chunk to avoid recompilation across cycles
-        ppo, train_chunk = self._get_ppo_for_game(game_name)
+        # Use cached PPO, train_chunk, and eval to avoid recompilation across cycles
+        ppo, train_chunk, cached_eval = self._get_ppo_for_game(game_name)
 
         if train_state is not None:
             # Transfer weights from previous game
@@ -833,9 +895,9 @@ class ContinualTrainer:
                 print(f"    Compiled in {compile_time:.1f}s", flush=True)
                 first_chunk = False
 
-            # Evaluation
+            # Evaluation (use cached_eval to avoid recompilation)
             rng, eval_rng = jax.random.split(rng)
-            lengths, returns = ppo.eval_callback(ppo, train_state, eval_rng)
+            lengths, returns = cached_eval(train_state.actor_ts.params, eval_rng)
 
             # Progress
             current_steps = (total_iters + chunk_size) * iteration_steps
@@ -875,9 +937,9 @@ class ContinualTrainer:
         elapsed = time.time() - start_time
         steps_per_sec = self.steps_per_game / elapsed
 
-        # Final evaluation
+        # Final evaluation (use cached_eval to avoid recompilation)
         rng, eval_rng = jax.random.split(rng)
-        lengths, returns = ppo.eval_callback(ppo, train_state, eval_rng)
+        lengths, returns = cached_eval(train_state.actor_ts.params, eval_rng)
         final_return = float(returns.mean())
 
         print(f"  Completed {game_name}: final_return={final_return:.1f}, "
@@ -897,14 +959,13 @@ class ContinualTrainer:
         eval_results = {}
 
         for game_name in GAME_ORDER:
-            ppo, _ = self._get_ppo_for_game(game_name)  # Unpack, don't need train_chunk for eval
+            # Use cached_eval to avoid recompilation
+            ppo, _, cached_eval = self._get_ppo_for_game(game_name)
 
-            # Transfer weights to this game's environment
-            rng, eval_rng, init_rng = jax.random.split(rng, 3)
-            eval_ts = self._transfer_train_state(train_state, ppo, init_rng)
-
-            # Evaluate
-            lengths, returns = ppo.eval_callback(ppo, eval_ts, eval_rng)
+            # Evaluate using current actor params directly
+            # (cached_eval works with any actor params, no transfer needed for eval)
+            rng, eval_rng = jax.random.split(rng)
+            lengths, returns = cached_eval(train_state.actor_ts.params, eval_rng)
             mean_return = float(returns.mean())
             eval_results[game_name] = mean_return
             print(f"    {game_name}: {mean_return:.1f}")
