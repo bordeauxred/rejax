@@ -24,7 +24,7 @@ from rejax.networks import (
     DiscreteCNNPolicy,
     CNNVNetwork,
 )
-from rejax.regularization import compute_gram_regularization_loss, apply_ortho_update
+from rejax.regularization import compute_gram_regularization_loss, apply_ortho_update, compute_l2_init_loss
 
 
 class Trajectory(struct.PyTreeNode):
@@ -62,6 +62,10 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     ortho_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.2)  # loss mode coefficient
     ortho_coeff: chex.Scalar = struct.field(pytree_node=True, default=1e-3)  # optimizer mode coefficient
     ortho_exclude_output: bool = struct.field(pytree_node=False, default=True)
+
+    # L2-Init regularization settings (regenerative regularization)
+    l2_init_coeff: Optional[chex.Scalar] = struct.field(pytree_node=True, default=None)  # None = disabled
+    l2_init_exclude_output: bool = struct.field(pytree_node=False, default=True)
 
     def make_act(self, ts):
         def act(obs, rng):
@@ -187,7 +191,18 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         )
         actor_ts = TrainState.create(apply_fn=(), params=actor_params, tx=tx)
         critic_ts = TrainState.create(apply_fn=(), params=critic_params, tx=tx)
-        return {"actor_ts": actor_ts, "critic_ts": critic_ts}
+
+        # Store initial params for L2-init regularization (frozen copy)
+        # These are used to compute ||θ - θ₀||² loss term
+        actor_init_params = jax.tree.map(lambda x: x, actor_params)
+        critic_init_params = jax.tree.map(lambda x: x, critic_params)
+
+        return {
+            "actor_ts": actor_ts,
+            "critic_ts": critic_ts,
+            "actor_init_params": actor_init_params,
+            "critic_init_params": critic_init_params,
+        }
 
     def train_iteration(self, ts):
         """Train iteration (fast path, discards metrics)."""
@@ -249,6 +264,16 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         )
         final_metrics["gram/actor"] = actor_gram_metrics["ortho/total_loss"]
         final_metrics["gram/critic"] = critic_gram_metrics["ortho/total_loss"]
+
+        # Compute L2-init distance metrics (always compute for diagnostics)
+        _, actor_l2_metrics = compute_l2_init_loss(
+            ts.actor_ts.params, ts.actor_init_params, lambda_coeff=1.0
+        )
+        _, critic_l2_metrics = compute_l2_init_loss(
+            ts.critic_ts.params, ts.critic_init_params, lambda_coeff=1.0
+        )
+        final_metrics["l2_init/actor_distance"] = actor_l2_metrics["l2_init/total_distance"]
+        final_metrics["l2_init/critic_distance"] = critic_l2_metrics["l2_init/total_distance"]
 
         # Compute current learning rate
         final_metrics["train/learning_rate"] = self._get_current_lr(ts.actor_ts.step)
@@ -379,6 +404,16 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                 )
                 total_loss = total_loss + ortho_loss
 
+            # Add L2-init loss if enabled
+            if self.l2_init_coeff is not None:
+                l2_loss, _ = compute_l2_init_loss(
+                    params,
+                    ts.actor_init_params,
+                    lambda_coeff=self.l2_init_coeff,
+                    exclude_output=self.l2_init_exclude_output,
+                )
+                total_loss = total_loss + l2_loss
+
             return total_loss, (pi_loss, entropy, approx_kl, clip_fraction)
 
         grads, (pi_loss, entropy, approx_kl, clip_fraction) = jax.grad(
@@ -424,6 +459,16 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                     exclude_output=self.ortho_exclude_output,
                 )
                 total_loss = total_loss + ortho_loss
+
+            # Add L2-init loss if enabled
+            if self.l2_init_coeff is not None:
+                l2_loss, _ = compute_l2_init_loss(
+                    params,
+                    ts.critic_init_params,
+                    lambda_coeff=self.l2_init_coeff,
+                    exclude_output=self.l2_init_exclude_output,
+                )
+                total_loss = total_loss + l2_loss
 
             return total_loss, value_loss
 

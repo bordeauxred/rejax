@@ -400,3 +400,179 @@ def compute_ortho_loss(params, lambda_coeff, debug=False, log_now=False, exclude
         exclude_output=exclude_last_layer,
         log_diagnostics=log_now
     )
+
+
+# =============================================================================
+# L2-Init Regularization (Regenerative Regularization)
+# =============================================================================
+
+def compute_l2_init_loss(
+    params: Dict,
+    init_params: Dict,
+    lambda_coeff: float = 0.001,
+    exclude_output: bool = True,
+) -> Tuple[jnp.ndarray, Dict[str, Any]]:
+    """
+    Compute L2 regularization loss towards initial parameters.
+
+    This implements "regenerative regularization" from Lyle et al. (2023):
+    loss = λ * ||θ - θ₀||²
+
+    Unlike standard L2 (towards zero), this preserves the initial weight
+    distribution and prevents rank collapse.
+
+    Args:
+        params: Current parameter dictionary (PyTree)
+        init_params: Initial parameter dictionary (PyTree, frozen at init)
+        lambda_coeff: Regularization coefficient (recommended: 0.001)
+        exclude_output: Whether to exclude the output layer
+
+    Returns:
+        (weighted_loss, metrics): The weighted loss and diagnostic metrics
+    """
+    kernels = get_dense_kernels(params)
+    init_kernels = get_dense_kernels(init_params)
+    kernel_paths = list(kernels.keys())
+
+    # Identify output layer to exclude
+    layers_to_exclude = set()
+    if exclude_output and kernel_paths:
+        output_path = _find_output_layer_path(kernel_paths)
+        if output_path:
+            layers_to_exclude.add(output_path)
+
+    total_distance = jnp.array(0.0)
+    metrics = {}
+
+    for path in kernel_paths:
+        if path in layers_to_exclude:
+            continue
+        if path not in init_kernels:
+            continue
+
+        W = kernels[path]
+        W_init = init_kernels[path]
+
+        # Handle batched parameters (ensemble critics: shape (N, n_in, n_out))
+        if W.ndim == 3:
+            # Sum over ensemble, compute squared L2 distance
+            distances = jax.vmap(lambda w, w0: jnp.sum((w - w0) ** 2))(W, W_init)
+            layer_distance = jnp.sum(distances)
+        elif W.ndim == 2:
+            layer_distance = jnp.sum((W - W_init) ** 2)
+        else:
+            continue
+
+        total_distance = total_distance + layer_distance
+
+        # Per-layer metrics
+        metric_name = path.replace('/kernel', '').replace('/', '_')
+        metrics[f"l2_init/distance_{metric_name}"] = layer_distance
+
+    metrics["l2_init/total_distance"] = total_distance
+    weighted_loss = lambda_coeff * total_distance
+
+    return weighted_loss, metrics
+
+
+# =============================================================================
+# NaP (Normalize-and-Project)
+# =============================================================================
+
+def compute_weight_norms(
+    params: Dict,
+    exclude_output: bool = True,
+) -> Dict[str, jnp.ndarray]:
+    """
+    Compute Frobenius norms of kernel weights.
+
+    Args:
+        params: Parameter dictionary (PyTree)
+        exclude_output: Whether to exclude the output layer
+
+    Returns:
+        Dictionary mapping kernel paths to their Frobenius norms
+    """
+    kernels = get_dense_kernels(params)
+    kernel_paths = list(kernels.keys())
+
+    # Identify output layer to exclude
+    layers_to_exclude = set()
+    if exclude_output and kernel_paths:
+        output_path = _find_output_layer_path(kernel_paths)
+        if output_path:
+            layers_to_exclude.add(output_path)
+
+    norms = {}
+    for path, W in kernels.items():
+        if path in layers_to_exclude:
+            continue
+
+        if W.ndim == 3:
+            # Ensemble: compute norm for each member
+            norms[path] = jax.vmap(jnp.linalg.norm)(W)
+        elif W.ndim == 2:
+            norms[path] = jnp.linalg.norm(W)
+
+    return norms
+
+
+def apply_nap_projection(
+    params: Dict,
+    init_norms: Dict[str, jnp.ndarray],
+    exclude_output: bool = True,
+) -> Dict:
+    """
+    Apply NaP (Normalize-and-Project) to maintain initial weight norms.
+
+    After each optimizer step, projects weights to maintain their initial norms:
+    W ← (ρₗ * W) / ||W||
+
+    where ρₗ is the initial norm of layer l.
+
+    This decouples the effective learning rate from parameter norm growth,
+    which helps maintain plasticity in continual learning.
+
+    Args:
+        params: Parameter dictionary (PyTree)
+        init_norms: Dictionary of initial norms from compute_weight_norms()
+        exclude_output: Whether to exclude the output layer
+
+    Returns:
+        Updated parameters with projected weights
+    """
+    flat_params = flatten_dict(params, sep="/")
+    kernel_paths = [k for k in flat_params.keys() if k.endswith('/kernel')]
+
+    # Identify output layer to exclude
+    layers_to_exclude = set()
+    if exclude_output and kernel_paths:
+        output_path = _find_output_layer_path(kernel_paths)
+        if output_path:
+            layers_to_exclude.add(output_path)
+
+    updated_params = dict(flat_params)
+
+    for path in kernel_paths:
+        if path in layers_to_exclude:
+            continue
+        if path not in init_norms:
+            continue
+
+        W = flat_params[path]
+        target_norm = init_norms[path]
+
+        if W.ndim == 3:
+            # Ensemble: project each member separately
+            def project_single(w, rho):
+                current_norm = jnp.linalg.norm(w)
+                # Avoid division by zero
+                scale = rho / (current_norm + 1e-8)
+                return w * scale
+            updated_params[path] = jax.vmap(project_single)(W, target_norm)
+        elif W.ndim == 2:
+            current_norm = jnp.linalg.norm(W)
+            scale = target_norm / (current_norm + 1e-8)
+            updated_params[path] = W * scale
+
+    return unflatten_dict(updated_params, sep="/")
