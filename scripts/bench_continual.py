@@ -1001,6 +1001,7 @@ class ContinualTrainer:
                     log_dict["ppo/clip_fraction"] = float(chunk_metrics["ppo/clip_fraction"])
                     log_dict["gram/actor"] = float(chunk_metrics["gram/actor"])
                     log_dict["gram/critic"] = float(chunk_metrics["gram/critic"])
+                    log_dict["train/learning_rate"] = float(chunk_metrics["train/learning_rate"])
 
                 wandb.log(log_dict, step=cumulative_step)
 

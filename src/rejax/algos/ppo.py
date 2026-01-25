@@ -250,7 +250,26 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         final_metrics["gram/actor"] = actor_gram_metrics["ortho/total_loss"]
         final_metrics["gram/critic"] = critic_gram_metrics["ortho/total_loss"]
 
+        # Compute current learning rate
+        final_metrics["train/learning_rate"] = self._get_current_lr(ts.actor_ts.step)
+
         return ts, final_metrics
+
+    def _get_current_lr(self, step):
+        """Compute current learning rate based on step count and schedule."""
+        if self.lr_schedule_fn is not None:
+            # Custom schedule
+            return self.lr_schedule_fn(step)
+        elif self.anneal_lr:
+            # Linear annealing from learning_rate to 0
+            num_updates = self.total_timesteps // (self.num_envs * self.num_steps)
+            total_steps = num_updates * self.num_epochs * self.num_minibatches
+            # Linear interpolation: lr * (1 - step/total)
+            progress = jnp.minimum(step / total_steps, 1.0)
+            return self.learning_rate * (1.0 - progress)
+        else:
+            # Constant learning rate
+            return self.learning_rate
 
     def collect_trajectories(self, ts):
         def env_step(ts, unused):
