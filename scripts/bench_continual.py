@@ -337,6 +337,7 @@ def create_ppo_config(
     mlp_hidden_sizes: Optional[Tuple[int, ...]] = None,  # CNN MLP layers (default 4x256)
     conv_channels: int = 16,
     anneal_lr: bool = False,
+    l2_init_coeff: Optional[float] = None,  # L2-Init regularization coefficient
 ) -> Dict:
     """Create PPO configuration dict."""
     if network_type == "cnn":
@@ -386,6 +387,10 @@ def create_ppo_config(
     if ortho_mode and ortho_mode != "none":
         config["ortho_mode"] = ortho_mode
         config["ortho_coeff"] = ortho_coeff
+
+    # L2-Init regularization
+    if l2_init_coeff is not None:
+        config["l2_init_coeff"] = l2_init_coeff
 
     # Calculate total gradient steps per game (used by multiple schedules)
     iteration_steps = num_envs * num_steps
@@ -537,6 +542,62 @@ EXPERIMENT_CONFIGS_MLP = [
         "learning_rate": 2.5e-4,
         "num_minibatches": 128,
         "use_bias": False,
+        "use_orthogonal_init": True,
+    },
+    # L2-Init baselines (regenerative regularization)
+    {
+        "name": "mlp_l2_init",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "l2_init_coeff": 0.001,
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    {
+        "name": "mlp_l2_init_0.01",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "l2_init_coeff": 0.01,  # Higher coefficient per literature
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    # L2-Init + AdaMO combined
+    {
+        "name": "mlp_l2_init_adamo",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "l2_init_coeff": 0.001,
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "groupsort",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": False,
+        "use_orthogonal_init": True,
+    },
+    # Small network variants with L2-Init
+    {
+        "name": "mlp_l2_init_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64),
+        "l2_init_coeff": 0.001,
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
         "use_orthogonal_init": True,
     },
 ]
@@ -783,6 +844,7 @@ class ContinualTrainer:
         permute_channels: bool = False,
         random_game_order: bool = False,
         seed: int = 0,
+        exclude_games: Optional[List[str]] = None,
     ):
         self.config_name = config_name
         self.experiment_config = experiment_config
@@ -797,13 +859,16 @@ class ContinualTrainer:
         self.random_game_order = random_game_order
         self.seed = seed
 
+        # Filter games if exclusions specified
+        self.game_list = [g for g in GAME_ORDER if g not in (exclude_games or [])]
+
         # Results storage
         self.results = {
             "config_name": config_name,
             "experiment_config": experiment_config,
             "steps_per_game": steps_per_game,
             "num_cycles": num_cycles,
-            "games": GAME_ORDER,
+            "games": self.game_list,
             "permute_channels": permute_channels,
             "random_game_order": random_game_order,
             "per_game_results": [],
@@ -896,6 +961,7 @@ class ContinualTrainer:
             mlp_hidden_sizes=self.experiment_config.get("mlp_hidden_sizes"),
             conv_channels=self.experiment_config.get("conv_channels", 32),
             anneal_lr=self.experiment_config.get("anneal_lr", False),
+            l2_init_coeff=self.experiment_config.get("l2_init_coeff"),
         )
         return PPO.create(**config)
 
@@ -905,6 +971,10 @@ class ContinualTrainer:
         Always resets optimizer state (Adam momentum) at task boundaries
         to give each task a fair start without bias from previous task's
         gradient history.
+
+        Preserves init_params from the original initialization for L2-Init
+        regularization (weights should stay close to original random init
+        throughout all games).
         """
         new_ts = new_ppo.init_state(rng)
 
@@ -912,6 +982,7 @@ class ContinualTrainer:
         # - Transfers network weights (features + heads)
         # - Fresh optimizer state (zeroed Adam momentum)
         # - Reset global_step (for any LR schedules like lyle_continual)
+        # - Preserve init_params from original training start (for L2-Init)
         new_ts = new_ts.replace(
             actor_ts=new_ts.actor_ts.replace(
                 params=old_ts.actor_ts.params,
@@ -922,6 +993,9 @@ class ContinualTrainer:
                 # opt_state stays fresh from new_ppo.init_state
             ),
             global_step=jnp.array(0),
+            # Preserve original init_params for L2-Init regularization
+            actor_init_params=old_ts.actor_init_params,
+            critic_init_params=old_ts.critic_init_params,
         )
         return new_ts
 
@@ -1050,6 +1124,9 @@ class ContinualTrainer:
                     log_dict["gram/actor"] = float(chunk_metrics["gram/actor"])
                     log_dict["gram/critic"] = float(chunk_metrics["gram/critic"])
                     log_dict["train/learning_rate"] = float(chunk_metrics["train/learning_rate"])
+                    # L2-init distance metrics (always logged for diagnostics)
+                    log_dict["l2_init/actor_distance"] = float(chunk_metrics["l2_init/actor_distance"])
+                    log_dict["l2_init/critic_distance"] = float(chunk_metrics["l2_init/critic_distance"])
 
                 wandb.log(log_dict, step=cumulative_step)
 
@@ -1075,11 +1152,11 @@ class ContinualTrainer:
         }
 
     def evaluate_all_games(self, train_state, rng, cycle_idx: int, current_game_idx: int):
-        """Evaluate current policy on all games."""
+        """Evaluate current policy on all games in the game list."""
         print(f"  Evaluating on all games after game {current_game_idx}...")
         eval_results = {}
 
-        for game_name in GAME_ORDER:
+        for game_name in self.game_list:
             # Use cached_eval to avoid recompilation
             ppo, _, _, cached_eval = self._get_ppo_for_game(game_name)
 
@@ -1132,10 +1209,10 @@ class ContinualTrainer:
             if self.random_game_order:
                 # Shuffle game order with deterministic seed per cycle
                 order_rng = np.random.default_rng(self.seed + cycle_idx * 7919)
-                cycle_game_order = order_rng.permutation(GAME_ORDER).tolist()
+                cycle_game_order = order_rng.permutation(self.game_list).tolist()
                 print(f"  Game order: {' -> '.join(cycle_game_order)}")
             else:
-                cycle_game_order = GAME_ORDER
+                cycle_game_order = self.game_list
 
             game_start = start_game if cycle_idx == start_cycle else 0
 
@@ -1227,6 +1304,7 @@ def create_ppo_for_game_with_config(
         mlp_hidden_sizes=experiment_config.get("mlp_hidden_sizes"),
         conv_channels=experiment_config.get("conv_channels", 32),
         anneal_lr=experiment_config.get("anneal_lr", False),
+        l2_init_coeff=experiment_config.get("l2_init_coeff"),
     )
     return PPO.create(**config)
 
@@ -1537,6 +1615,9 @@ def main():
                         help="Randomly permute observation channels for each game")
     parser.add_argument("--random-game-order", action="store_true",
                         help="Shuffle game order each cycle")
+    parser.add_argument("--exclude-games", nargs="+", default=[],
+                        choices=GAME_ORDER,
+                        help="Games to exclude (e.g., Seaquest-MinAtar)")
 
     args = parser.parse_args()
 
@@ -1596,6 +1677,7 @@ def main():
                             "seed": args.seed + seed_idx,
                             "permute_channels": args.permute_channels,
                             "random_game_order": args.random_game_order,
+                            "exclude_games": args.exclude_games,
                         },
                         reinit=True,
                     )
@@ -1613,6 +1695,7 @@ def main():
                     permute_channels=args.permute_channels,
                     random_game_order=args.random_game_order,
                     seed=args.seed + seed_idx,
+                    exclude_games=args.exclude_games,
                 )
 
                 results = trainer.run(rng)
