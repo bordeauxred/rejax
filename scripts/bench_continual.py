@@ -783,21 +783,27 @@ class ContinualTrainer:
                 return jax.lax.fori_loop(0, num_iters, body, ts)
 
             # Train_chunk with metrics - use for research/logging
-            @jax.jit
-            def train_chunk_with_metrics(ts, num_iters):
-                def body(carry, _):
-                    ts, _ = carry
-                    ts, metrics = ppo.train_iteration_with_metrics(ts)
-                    return (ts, metrics), metrics
-                (ts, last_metrics), all_metrics = jax.lax.scan(body, (ts, {}), None, length=num_iters)
-                # all_metrics: dict of arrays (num_iters,)
-                mean_metrics = jax.tree.map(jnp.mean, all_metrics)
-                return ts, mean_metrics
+            # Cache for metrics train chunks (keyed by num_iters since scan needs static length)
+            metrics_chunk_cache = {}
+
+            def get_train_chunk_with_metrics(n_iters):
+                """Get or create a JIT-compiled metrics train chunk for given iteration count."""
+                if n_iters not in metrics_chunk_cache:
+                    @jax.jit
+                    def _train_chunk_with_metrics(ts):
+                        def body(ts, _):
+                            ts, metrics = ppo.train_iteration_with_metrics(ts)
+                            return ts, metrics
+                        ts, all_metrics = jax.lax.scan(body, ts, None, length=n_iters)
+                        mean_metrics = jax.tree.map(jnp.mean, all_metrics)
+                        return ts, mean_metrics
+                    metrics_chunk_cache[n_iters] = _train_chunk_with_metrics
+                return metrics_chunk_cache[n_iters]
 
             # Create cached eval function that doesn't recompile on each call
             cached_eval = create_cached_eval_fn(ppo)
 
-            self._ppo_cache[game_name] = (ppo, train_chunk, train_chunk_with_metrics, cached_eval)
+            self._ppo_cache[game_name] = (ppo, train_chunk, get_train_chunk_with_metrics, cached_eval)
         return self._ppo_cache[game_name]
 
     def _create_ppo_for_game(self, game_name: str) -> PPO:
@@ -903,7 +909,7 @@ class ContinualTrainer:
     def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int):
         """Train on a single game, optionally continuing from existing train_state."""
         # Use cached PPO, train_chunk, and eval to avoid recompilation across cycles
-        ppo, train_chunk, train_chunk_with_metrics, cached_eval = self._get_ppo_for_game(game_name)
+        ppo, train_chunk, get_train_chunk_with_metrics, cached_eval = self._get_ppo_for_game(game_name)
 
         if train_state is not None:
             # Transfer weights from previous game
@@ -936,7 +942,8 @@ class ContinualTrainer:
 
             # Use metrics version when wandb is enabled, fast version otherwise
             if self.use_wandb:
-                train_state, chunk_metrics = train_chunk_with_metrics(train_state, chunk_size)
+                train_chunk_with_metrics = get_train_chunk_with_metrics(chunk_size)
+                train_state, chunk_metrics = train_chunk_with_metrics(train_state)
             else:
                 train_state = train_chunk(train_state, chunk_size)
                 chunk_metrics = None

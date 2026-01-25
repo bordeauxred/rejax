@@ -65,11 +65,10 @@ def main():
 
     @jax.jit
     def train_with_metrics(ts):
-        def body(carry, _):
-            ts, _ = carry
+        def body(ts, _):
             ts, metrics = ppo.train_iteration_with_metrics(ts)
-            return (ts, metrics), metrics
-        (ts, _), all_metrics = jax.lax.scan(body, (ts, {}), None, length=N_ITERS)
+            return ts, metrics
+        ts, all_metrics = jax.lax.scan(body, ts, None, length=N_ITERS)
         return ts, jax.tree.map(lambda x: x.mean(), all_metrics)
 
     ts2, metrics = train_with_metrics(ts)
