@@ -177,16 +177,22 @@ UNIFIED_ACTIONS = 6
 
 
 class PaddedMinAtarEnv:
-    """Wrapper that pads observations and unifies action space for MinAtar games."""
+    """Wrapper that pads observations and unifies action space for MinAtar games.
 
-    def __init__(self, env, original_channels: int, original_actions: int):
+    Optionally applies channel permutation before padding for continual learning
+    experiments that need to prevent memorization of fixed channel orderings.
+    """
+
+    def __init__(self, env, original_channels: int, original_actions: int,
+                 channel_perm: Optional[np.ndarray] = None):
         self._env = env
         self.original_channels = original_channels
         self.original_actions = original_actions
+        self.channel_perm = channel_perm  # e.g., [2, 0, 3, 1] for 4 channels
 
     def __getattr__(self, name):
-        if name in ["_env", "original_channels", "original_actions", "reset", "step",
-                    "observation_space", "action_space"]:
+        if name in ["_env", "original_channels", "original_actions", "channel_perm",
+                    "reset", "step", "observation_space", "action_space"]:
             return super().__getattribute__(name)
         return getattr(self._env, name)
 
@@ -217,21 +223,37 @@ class PaddedMinAtarEnv:
         return obs, state, reward, done, info
 
     def _pad_obs(self, obs):
-        """Pad observations from (10, 10, C) to (10, 10, 10)."""
+        """Pad observations from (10, 10, C) to (10, 10, 10).
+
+        If channel_perm is set, permutes channels before padding to prevent
+        memorization of fixed channel orderings in continual learning.
+        """
+        # Apply channel permutation before padding
+        if self.channel_perm is not None:
+            obs = obs[:, :, self.channel_perm]
+        # Then pad to unified channels
         if self.original_channels < UNIFIED_CHANNELS:
             pad_width = UNIFIED_CHANNELS - self.original_channels
             obs = jnp.pad(obs, ((0, 0), (0, 0), (0, pad_width)))
         return obs.astype(jnp.float32)
 
 
-def create_padded_env(game_name: str) -> Tuple[PaddedMinAtarEnv, Any]:
-    """Create a padded MinAtar environment for the given game."""
+def create_padded_env(game_name: str, channel_perm: Optional[np.ndarray] = None) -> Tuple[PaddedMinAtarEnv, Any]:
+    """Create a padded MinAtar environment for the given game.
+
+    Args:
+        game_name: Name of the MinAtar game
+        channel_perm: Optional channel permutation array. If provided, observation
+            channels are reordered according to this permutation before padding.
+            E.g., for a 4-channel game, channel_perm=[2, 0, 3, 1] would swap channels.
+    """
     game_info = MINATAR_GAMES[game_name]
     env = game_info["env_cls"]()
     padded_env = PaddedMinAtarEnv(
         env,
         original_channels=game_info["channels"],
         original_actions=game_info["actions"],
+        channel_perm=channel_perm,
     )
     return padded_env, padded_env.default_params
 
@@ -489,6 +511,32 @@ EXPERIMENT_CONFIGS_MLP = [
         "use_bias": False,
         "use_orthogonal_init": True,
     },
+    # Small network variants for Experiment 1 (reduced capacity ablation)
+    {
+        "name": "mlp_baseline_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64),  # 3 layers, small
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    {
+        "name": "mlp_adamo_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "groupsort",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": False,
+        "use_orthogonal_init": True,
+    },
 ]
 
 # =============================================================================
@@ -730,6 +778,9 @@ class ContinualTrainer:
         checkpoint_dir: Optional[Path] = None,
         use_wandb: bool = False,
         wandb_project: str = "rejax-continual",
+        permute_channels: bool = False,
+        random_game_order: bool = False,
+        seed: int = 0,
     ):
         self.config_name = config_name
         self.experiment_config = experiment_config
@@ -740,6 +791,9 @@ class ContinualTrainer:
         self.checkpoint_dir = checkpoint_dir or Path("checkpoints")
         self.use_wandb = use_wandb
         self.wandb_project = wandb_project
+        self.permute_channels = permute_channels
+        self.random_game_order = random_game_order
+        self.seed = seed
 
         # Results storage
         self.results = {
@@ -748,14 +802,17 @@ class ContinualTrainer:
             "steps_per_game": steps_per_game,
             "num_cycles": num_cycles,
             "games": GAME_ORDER,
+            "permute_channels": permute_channels,
+            "random_game_order": random_game_order,
             "per_game_results": [],
         }
 
         # Cache PPO instances per game to avoid recompilation across cycles
         # This keeps only 5 compiled functions in memory (one per game)
+        # When using channel permutation, cache is keyed by (game, cycle) instead
         self._ppo_cache = {}
 
-    def _get_ppo_for_game(self, game_name: str) -> Tuple[PPO, Any, Any, Any]:
+    def _get_ppo_for_game(self, game_name: str, channel_perm: Optional[np.ndarray] = None) -> Tuple[PPO, Any, Any, Any]:
         """Get cached (PPO, train_chunk, train_chunk_with_metrics, cached_eval) for a game.
 
         Caches PPO, its JIT-compiled train_chunk (fast, no metrics), train_chunk_with_metrics
@@ -767,9 +824,15 @@ class ContinualTrainer:
         The cached_eval is critical: the standard evaluate() has act as static_argnames,
         so each new act closure from make_act() triggers recompilation. cached_eval
         takes actor_params as a pytree argument instead, so it compiles once per game.
+
+        When channel permutation is enabled, cache key includes permutation tuple to
+        ensure different permutations get separate compiled functions.
         """
-        if game_name not in self._ppo_cache:
-            ppo = self._create_ppo_for_game(game_name)
+        # Cache key includes permutation when enabled
+        cache_key = (game_name, tuple(channel_perm) if channel_perm is not None else None)
+
+        if cache_key not in self._ppo_cache:
+            ppo = self._create_ppo_for_game(game_name, channel_perm)
 
             # Fast train_chunk (no metrics) - use for non-research runs
             @jax.jit
@@ -799,12 +862,12 @@ class ContinualTrainer:
             # Create cached eval function that doesn't recompile on each call
             cached_eval = create_cached_eval_fn(ppo)
 
-            self._ppo_cache[game_name] = (ppo, train_chunk, get_train_chunk_with_metrics, cached_eval)
-        return self._ppo_cache[game_name]
+            self._ppo_cache[cache_key] = (ppo, train_chunk, get_train_chunk_with_metrics, cached_eval)
+        return self._ppo_cache[cache_key]
 
-    def _create_ppo_for_game(self, game_name: str) -> PPO:
+    def _create_ppo_for_game(self, game_name: str, channel_perm: Optional[np.ndarray] = None) -> PPO:
         """Create PPO instance configured for a specific game."""
-        env, env_params = create_padded_env(game_name)
+        env, env_params = create_padded_env(game_name, channel_perm)
         # Use config's num_envs if specified, otherwise fall back to constructor param
         effective_num_envs = self.experiment_config.get("num_envs", self.num_envs)
         config = create_ppo_config(
@@ -887,10 +950,12 @@ class ContinualTrainer:
 
         return progress_callback
 
-    def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int):
+    def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int,
+                          channel_perm: Optional[np.ndarray] = None):
         """Train on a single game, optionally continuing from existing train_state."""
         # Use cached PPO, train_chunk, and eval to avoid recompilation across cycles
-        ppo, train_chunk, get_train_chunk_with_metrics, cached_eval = self._get_ppo_for_game(game_name)
+        ppo, train_chunk, get_train_chunk_with_metrics, cached_eval = self._get_ppo_for_game(
+            game_name, channel_perm)
 
         if train_state is not None:
             # Transfer weights from previous game
@@ -1026,6 +1091,19 @@ class ContinualTrainer:
 
         return eval_results, rng
 
+    def _generate_channel_perm(self, game_name: str, cycle_idx: int) -> Optional[np.ndarray]:
+        """Generate a channel permutation for a game if permute_channels is enabled."""
+        if not self.permute_channels:
+            return None
+        # Use deterministic seed based on game, cycle, and base seed
+        # Use game index to avoid hash overflow issues
+        game_idx = GAME_ORDER.index(game_name) if game_name in GAME_ORDER else 0
+        perm_seed = abs(self.seed * 10000 + game_idx * 100 + cycle_idx) % (2**31)
+        rng = np.random.default_rng(perm_seed)
+        num_channels = MINATAR_GAMES[game_name]["channels"]
+        perm = rng.permutation(num_channels)
+        return perm
+
     def run(self, rng, start_cycle: int = 0, start_game: int = 0, initial_train_state=None):
         """Run the full continual learning experiment."""
         train_state = initial_train_state
@@ -1033,20 +1111,38 @@ class ContinualTrainer:
         # Print update diagnostics at start
         print(f"\nConfig: {self.config_name}")
         print_update_diagnostics(self.experiment_config, self.steps_per_game)
+        if self.permute_channels:
+            print(f"  Channel permutation: ENABLED")
+        if self.random_game_order:
+            print(f"  Random game order: ENABLED")
 
         for cycle_idx in range(start_cycle, self.num_cycles):
             print(f"\n{'='*60}", flush=True)
             print(f"Cycle {cycle_idx + 1}/{self.num_cycles}", flush=True)
             print(f"{'='*60}", flush=True)
 
+            # Determine game order for this cycle
+            if self.random_game_order:
+                # Shuffle game order with deterministic seed per cycle
+                order_rng = np.random.default_rng(self.seed + cycle_idx * 7919)
+                cycle_game_order = order_rng.permutation(GAME_ORDER).tolist()
+                print(f"  Game order: {' -> '.join(cycle_game_order)}")
+            else:
+                cycle_game_order = GAME_ORDER
+
             game_start = start_game if cycle_idx == start_cycle else 0
 
-            for game_idx, game_name in enumerate(GAME_ORDER[game_start:], start=game_start):
-                print(f"\nGame {game_idx + 1}/{len(GAME_ORDER)}: {game_name}", flush=True)
+            for game_idx, game_name in enumerate(cycle_game_order[game_start:], start=game_start):
+                # Generate channel permutation for this game/cycle
+                channel_perm = self._generate_channel_perm(game_name, cycle_idx)
+                if channel_perm is not None:
+                    print(f"\nGame {game_idx + 1}/{len(cycle_game_order)}: {game_name} (channel perm: {channel_perm})", flush=True)
+                else:
+                    print(f"\nGame {game_idx + 1}/{len(cycle_game_order)}: {game_name}", flush=True)
 
                 # Train on this game (PPO instances cached to avoid recompilation)
                 train_state, rng, game_result = self.train_single_game(
-                    game_name, train_state, rng, cycle_idx
+                    game_name, train_state, rng, cycle_idx, channel_perm=channel_perm
                 )
                 self.results["per_game_results"].append(game_result)
 
@@ -1430,6 +1526,10 @@ def main():
                         help="Experiment configurations to run")
     parser.add_argument("--parallel-seeds", action="store_true",
                         help="Run all seeds in parallel using vmap (faster but no wandb/checkpoints)")
+    parser.add_argument("--permute-channels", action="store_true",
+                        help="Randomly permute observation channels for each game")
+    parser.add_argument("--random-game-order", action="store_true",
+                        help="Shuffle game order each cycle")
 
     args = parser.parse_args()
 
@@ -1487,6 +1587,8 @@ def main():
                             "steps_per_game": args.steps_per_game,
                             "num_cycles": args.num_cycles,
                             "seed": args.seed + seed_idx,
+                            "permute_channels": args.permute_channels,
+                            "random_game_order": args.random_game_order,
                         },
                         reinit=True,
                     )
@@ -1501,6 +1603,9 @@ def main():
                     checkpoint_dir=checkpoint_dir / config_name,
                     use_wandb=args.use_wandb,
                     wandb_project=args.wandb_project,
+                    permute_channels=args.permute_channels,
+                    random_game_order=args.random_game_order,
+                    seed=args.seed + seed_idx,
                 )
 
                 results = trainer.run(rng)
