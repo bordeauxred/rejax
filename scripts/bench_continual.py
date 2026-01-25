@@ -1102,6 +1102,9 @@ class ContinualTrainer:
                     current_steps                                   # current game progress
                 )
 
+                # Game ID is consistent across shuffles (based on original GAME_ORDER)
+                game_id = GAME_ORDER.index(game_name) if game_name in GAME_ORDER else -1
+
                 log_dict = {
                     # Per-game tracking
                     f"train/{game_name}/return": mean_return,
@@ -1112,7 +1115,8 @@ class ContinualTrainer:
                     # Global tracking
                     "return": mean_return,
                     "cycle": cycle_idx,
-                    "game_idx": game_idx_in_cycle,
+                    "game_idx": game_idx_in_cycle,  # position in this cycle (0,1,2,3)
+                    "game_id": game_id,              # consistent ID: Breakout=0, Asterix=1, SI=2, Freeway=3, Seaquest=4
                     "game": game_name,
                 }
 
