@@ -8,7 +8,7 @@
 set -e
 
 STEPS_PER_GAME=20000000
-NUM_CYCLES=5
+NUM_CYCLES=4
 NUM_SEEDS=2
 EVAL_FREQ=500000
 WANDB_PROJECT="continual_minatar_ppo_long_with_metrics"
