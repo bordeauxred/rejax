@@ -39,6 +39,38 @@ from gymnax.environments.minatar.freeway import MinFreeway
 from minatar_seaquest_fixed import MinSeaquestFixed
 
 from rejax import PPO
+from rejax.regularization import compute_gram_regularization_loss
+
+
+def compute_ortho_metrics(actor_params, critic_params):
+    """Compute Gram deviation metrics for actor and critic networks.
+
+    Returns dict with ortho/actor_loss, ortho/critic_loss, ortho/total_loss
+    and per-layer breakdowns.
+    """
+    # Compute actor ortho loss (exclude output layer)
+    _, actor_metrics = compute_gram_regularization_loss(
+        actor_params, lambda_coeff=1.0, exclude_output=True, log_diagnostics=False
+    )
+
+    # Compute critic ortho loss (exclude output layer)
+    _, critic_metrics = compute_gram_regularization_loss(
+        critic_params, lambda_coeff=1.0, exclude_output=True, log_diagnostics=False
+    )
+
+    # Rename metrics with actor/critic prefix
+    metrics = {}
+    for k, v in actor_metrics.items():
+        metrics[k.replace("ortho/", "ortho/actor_")] = float(v)
+    for k, v in critic_metrics.items():
+        metrics[k.replace("ortho/", "ortho/critic_")] = float(v)
+
+    # Add combined totals
+    metrics["ortho/actor_loss"] = float(actor_metrics.get("ortho/total_loss", 0.0))
+    metrics["ortho/critic_loss"] = float(critic_metrics.get("ortho/total_loss", 0.0))
+    metrics["ortho/total_loss"] = metrics["ortho/actor_loss"] + metrics["ortho/critic_loss"]
+
+    return metrics
 
 
 def create_cached_eval_fn(ppo):
@@ -727,12 +759,14 @@ class ContinualTrainer:
         # This keeps only 5 compiled functions in memory (one per game)
         self._ppo_cache = {}
 
-    def _get_ppo_for_game(self, game_name: str) -> Tuple[PPO, Any, Any]:
-        """Get cached (PPO, train_chunk, cached_eval) for a game, creating if needed.
+    def _get_ppo_for_game(self, game_name: str) -> Tuple[PPO, Any, Any, Any]:
+        """Get cached (PPO, train_chunk, train_chunk_with_metrics, cached_eval) for a game.
 
-        Caches PPO, its JIT-compiled train_chunk, and a cached eval function to avoid
-        recompilation across cycles. Without this, each cycle would create new function
-        objects that JAX traces separately, causing OOM after ~14 games.
+        Caches PPO, its JIT-compiled train_chunk (fast, no metrics), train_chunk_with_metrics
+        (for research logging), and a cached eval function to avoid recompilation across cycles.
+
+        Without caching, each cycle would create new function objects that JAX traces
+        separately, causing OOM after ~14 games.
 
         The cached_eval is critical: the standard evaluate() has act as static_argnames,
         so each new act closure from make_act() triggers recompilation. cached_eval
@@ -741,17 +775,29 @@ class ContinualTrainer:
         if game_name not in self._ppo_cache:
             ppo = self._create_ppo_for_game(game_name)
 
-            # Create train_chunk closure that captures this specific ppo
+            # Fast train_chunk (no metrics) - use for non-research runs
             @jax.jit
             def train_chunk(ts, num_iters):
                 def body(_, ts):
                     return ppo.train_iteration(ts)
                 return jax.lax.fori_loop(0, num_iters, body, ts)
 
+            # Train_chunk with metrics - use for research/logging
+            @jax.jit
+            def train_chunk_with_metrics(ts, num_iters):
+                def body(carry, _):
+                    ts, _ = carry
+                    ts, metrics = ppo.train_iteration_with_metrics(ts)
+                    return (ts, metrics), metrics
+                (ts, last_metrics), all_metrics = jax.lax.scan(body, (ts, {}), None, length=num_iters)
+                # all_metrics: dict of arrays (num_iters,)
+                mean_metrics = jax.tree.map(jnp.mean, all_metrics)
+                return ts, mean_metrics
+
             # Create cached eval function that doesn't recompile on each call
             cached_eval = create_cached_eval_fn(ppo)
 
-            self._ppo_cache[game_name] = (ppo, train_chunk, cached_eval)
+            self._ppo_cache[game_name] = (ppo, train_chunk, train_chunk_with_metrics, cached_eval)
         return self._ppo_cache[game_name]
 
     def _create_ppo_for_game(self, game_name: str) -> PPO:
@@ -857,7 +903,7 @@ class ContinualTrainer:
     def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int):
         """Train on a single game, optionally continuing from existing train_state."""
         # Use cached PPO, train_chunk, and eval to avoid recompilation across cycles
-        ppo, train_chunk, cached_eval = self._get_ppo_for_game(game_name)
+        ppo, train_chunk, train_chunk_with_metrics, cached_eval = self._get_ppo_for_game(game_name)
 
         if train_state is not None:
             # Transfer weights from previous game
@@ -887,7 +933,14 @@ class ContinualTrainer:
         first_chunk = True
         while total_iters < num_iterations:
             chunk_size = min(eval_interval, num_iterations - total_iters)
-            train_state = train_chunk(train_state, chunk_size)
+
+            # Use metrics version when wandb is enabled, fast version otherwise
+            if self.use_wandb:
+                train_state, chunk_metrics = train_chunk_with_metrics(train_state, chunk_size)
+            else:
+                train_state = train_chunk(train_state, chunk_size)
+                chunk_metrics = None
+
             jax.block_until_ready(train_state)
 
             if first_chunk:
@@ -911,14 +964,14 @@ class ContinualTrainer:
             if self.use_wandb:
                 import wandb
                 # Calculate cumulative step for Lyle-style plots
-                # game_idx is passed from run(), but we need it here
                 game_idx = GAME_ORDER.index(game_name)
                 cumulative_step = (
                     cycle_idx * len(GAME_ORDER) * self.steps_per_game +  # previous cycles
                     game_idx * self.steps_per_game +                      # previous games this cycle
                     current_steps                                          # current game progress
                 )
-                wandb.log({
+
+                log_dict = {
                     # Per-game tracking
                     f"train/{game_name}/return": mean_return,
                     f"train/{game_name}/step": current_steps,
@@ -930,7 +983,19 @@ class ContinualTrainer:
                     "cycle": cycle_idx,
                     "game_idx": game_idx,
                     "game": game_name,
-                }, step=cumulative_step)  # Use cumulative_step as x-axis
+                }
+
+                # Add training metrics from chunk_metrics
+                if chunk_metrics is not None:
+                    log_dict["loss/policy"] = float(chunk_metrics["loss/policy"])
+                    log_dict["loss/value"] = float(chunk_metrics["loss/value"])
+                    log_dict["loss/entropy"] = float(chunk_metrics["loss/entropy"])
+                    log_dict["ppo/approx_kl"] = float(chunk_metrics["ppo/approx_kl"])
+                    log_dict["ppo/clip_fraction"] = float(chunk_metrics["ppo/clip_fraction"])
+                    log_dict["gram/actor"] = float(chunk_metrics["gram/actor"])
+                    log_dict["gram/critic"] = float(chunk_metrics["gram/critic"])
+
+                wandb.log(log_dict, step=cumulative_step)
 
             total_iters += chunk_size
 
@@ -960,7 +1025,7 @@ class ContinualTrainer:
 
         for game_name in GAME_ORDER:
             # Use cached_eval to avoid recompilation
-            ppo, _, cached_eval = self._get_ppo_for_game(game_name)
+            ppo, _, _, cached_eval = self._get_ppo_for_game(game_name)
 
             # Evaluate using current actor params directly
             # (cached_eval works with any actor params, no transfer needed for eval)

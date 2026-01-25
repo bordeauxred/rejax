@@ -190,6 +190,7 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         return {"actor_ts": actor_ts, "critic_ts": critic_ts}
 
     def train_iteration(self, ts):
+        """Train iteration (fast path, discards metrics)."""
         ts, trajectories = self.collect_trajectories(ts)
 
         last_val = self.critic.apply(ts.critic_ts.params, ts.last_obs)
@@ -201,15 +202,55 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             ts = ts.replace(rng=rng)
             batch = AdvantageMinibatch(trajectories, advantages, targets)
             minibatches = self.shuffle_and_split(batch, minibatch_rng)
-            ts, _ = jax.lax.scan(
-                lambda ts, mbs: (self.update(ts, mbs), None),
-                ts,
-                minibatches,
-            )
+
+            def update_minibatch(ts, mbs):
+                ts, _ = self.update(ts, mbs)  # Discard metrics for speed
+                return ts, None
+
+            ts, _ = jax.lax.scan(update_minibatch, ts, minibatches)
             return ts, None
 
         ts, _ = jax.lax.scan(update_epoch, ts, None, self.num_epochs)
         return ts
+
+    def train_iteration_with_metrics(self, ts):
+        """Train iteration that returns metrics dict. Use for research/logging."""
+        ts, trajectories = self.collect_trajectories(ts)
+
+        last_val = self.critic.apply(ts.critic_ts.params, ts.last_obs)
+        last_val = jnp.where(ts.last_done, 0, last_val)
+        advantages, targets = self.calculate_gae(trajectories, last_val)
+
+        def update_epoch(ts, unused):
+            rng, minibatch_rng = jax.random.split(ts.rng)
+            ts = ts.replace(rng=rng)
+            batch = AdvantageMinibatch(trajectories, advantages, targets)
+            minibatches = self.shuffle_and_split(batch, minibatch_rng)
+
+            def update_minibatch(ts, mbs):
+                ts, metrics = self.update(ts, mbs)
+                return ts, metrics
+
+            ts, epoch_metrics = jax.lax.scan(update_minibatch, ts, minibatches)
+            return ts, epoch_metrics
+
+        ts, all_epoch_metrics = jax.lax.scan(update_epoch, ts, None, self.num_epochs)
+
+        # all_epoch_metrics: dict of arrays (num_epochs, num_minibatches)
+        # Flatten and mean across epochs and minibatches
+        final_metrics = jax.tree.map(lambda x: x.mean(), all_epoch_metrics)
+
+        # Compute Gram deviation after all updates
+        _, actor_gram_metrics = compute_gram_regularization_loss(
+            ts.actor_ts.params, lambda_coeff=1.0, exclude_output=True
+        )
+        _, critic_gram_metrics = compute_gram_regularization_loss(
+            ts.critic_ts.params, lambda_coeff=1.0, exclude_output=True
+        )
+        final_metrics["gram/actor"] = actor_gram_metrics["ortho/total_loss"]
+        final_metrics["gram/critic"] = critic_gram_metrics["ortho/total_loss"]
+
+        return ts, final_metrics
 
     def collect_trajectories(self, ts):
         def env_step(ts, unused):
@@ -304,6 +345,10 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             pi_loss2 = clipped_ratio * advantages
             pi_loss = -jnp.minimum(pi_loss1, pi_loss2).mean()
 
+            # Compute diagnostics
+            approx_kl = ((ratio - 1) - jnp.log(ratio)).mean()
+            clip_fraction = (jnp.abs(ratio - 1) > self.clip_eps).mean()
+
             total_loss = pi_loss - self.ent_coef * entropy
 
             # Add ortho loss if in loss mode
@@ -315,9 +360,11 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                 )
                 total_loss = total_loss + ortho_loss
 
-            return total_loss
+            return total_loss, (pi_loss, entropy, approx_kl, clip_fraction)
 
-        grads = jax.grad(actor_loss_fn)(ts.actor_ts.params)
+        grads, (pi_loss, entropy, approx_kl, clip_fraction) = jax.grad(
+            actor_loss_fn, has_aux=True
+        )(ts.actor_ts.params)
         new_actor_ts = ts.actor_ts.apply_gradients(grads=grads)
 
         # Apply ortho update if in optimizer mode
@@ -330,7 +377,13 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             )
             new_actor_ts = new_actor_ts.replace(params=new_params)
 
-        return ts.replace(actor_ts=new_actor_ts)
+        metrics = {
+            "loss/policy": pi_loss,
+            "loss/entropy": entropy,
+            "ppo/approx_kl": approx_kl,
+            "ppo/clip_fraction": clip_fraction,
+        }
+        return ts.replace(actor_ts=new_actor_ts), metrics
 
     def update_critic(self, ts, batch):
         def critic_loss_fn(params):
@@ -353,9 +406,9 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                 )
                 total_loss = total_loss + ortho_loss
 
-            return total_loss
+            return total_loss, value_loss
 
-        grads = jax.grad(critic_loss_fn)(ts.critic_ts.params)
+        grads, value_loss = jax.grad(critic_loss_fn, has_aux=True)(ts.critic_ts.params)
         new_critic_ts = ts.critic_ts.apply_gradients(grads=grads)
 
         # Apply ortho update if in optimizer mode
@@ -368,9 +421,11 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             )
             new_critic_ts = new_critic_ts.replace(params=new_params)
 
-        return ts.replace(critic_ts=new_critic_ts)
+        metrics = {"loss/value": value_loss}
+        return ts.replace(critic_ts=new_critic_ts), metrics
 
     def update(self, ts, batch):
-        ts = self.update_actor(ts, batch)
-        ts = self.update_critic(ts, batch)
-        return ts
+        ts, actor_metrics = self.update_actor(ts, batch)
+        ts, critic_metrics = self.update_critic(ts, batch)
+        metrics = {**actor_metrics, **critic_metrics}
+        return ts, metrics
