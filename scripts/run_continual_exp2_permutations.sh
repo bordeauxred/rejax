@@ -4,11 +4,12 @@
 # Goal: Break memorization of fixed game order + see long-term degradation
 #
 # Network:      256-256-256-256 MLP (standard)
-# Steps/game:   10M (faster iteration)
+# Steps/game:   15M (enough to overfit each task)
 # Cycles:       10 (enough to see degradation)
 # Methods:      MLP baseline vs MLP AdaMO (2 configs)
 # Seeds:        2
-# Permutation:  YES - both channels AND game order
+# Games:        4 (excludes Seaquest - reward scale outlier ~170 vs ~50)
+# Permutation:  YES - all 10 channels shuffled + game order
 #
 # FEATURES:
 #   - Channel permutation: randomly permute obs channels per game
@@ -18,8 +19,8 @@
 # HYPOTHESIS: Without fixed patterns to exploit, baseline will degrade
 #             faster. Should see performance cliff by cycle 6-8.
 #
-# RUNTIME: 10M × 5 games × 10 cycles × 2 methods × 2 seeds = 2B steps
-#          → ~12h on A100
+# RUNTIME: 15M × 4 games × 10 cycles × 2 methods × 2 seeds = 2.4B steps
+#          → ~8h on H100
 #
 # Usage:
 #   ./scripts/run_continual_exp2_permutations.sh                    # Full run
@@ -27,9 +28,9 @@
 
 set -e
 
-STEPS_PER_GAME=${1:-10000000}
+STEPS_PER_GAME=${1:-25000000}
 NUM_CYCLES=${2:-10}
-NUM_SEEDS=${3:-3}
+NUM_SEEDS=${3:-2}
 NUM_ENVS=${4:-2048}
 EVAL_FREQ=${5:-500000}
 
@@ -54,8 +55,11 @@ echo "  1. mlp_baseline - MLP 256x4, ReLU, standard PPO"
 echo "  2. mlp_adamo    - MLP 256x4, groupsort, AdaMO"
 echo ""
 echo "Permutations ENABLED:"
-echo "  - Channel permutation: random per game/cycle"
+echo "  - Channel permutation: all 10 channels shuffled per game/cycle"
 echo "  - Game order shuffle: random per cycle"
+echo ""
+echo "Excluded: Seaquest-MinAtar (reward scale outlier)"
+echo "Games: Breakout, Asterix, SpaceInvaders, Freeway"
 echo "=============================================================="
 
 cd "$(dirname "$0")/.."
@@ -75,6 +79,7 @@ uv run python scripts/bench_continual.py \
     --configs mlp_baseline mlp_adamo \
     --permute-channels \
     --random-game-order \
+    --exclude-games Seaquest-MinAtar \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --use-wandb \
