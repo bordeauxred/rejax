@@ -11,7 +11,7 @@ STEPS_PER_GAME=20000000
 NUM_CYCLES=4
 NUM_SEEDS=2
 EVAL_FREQ=500000
-WANDB_PROJECT="continual_minatar_ppo_long_with_metrics"
+WANDB_PROJECT="continual_minatar_ppo_long_with_metrics_constant_lr"
 
 echo "=========================================="
 echo "Continual Learning (OOM-Fixed Pipeline)"
@@ -25,6 +25,9 @@ echo ""
 echo "Features:"
 echo "  - Cached eval functions (OOM fix)"
 echo "  - Extended metrics logging (~14% overhead)"
+echo "  - Optimizer reset at each game boundary (fresh Adam momentum)"
+echo "  - Constant LR for baseline/AdaMO configs"
+echo "  - Lyle configs use warmup+cosine schedule"
 echo ""
 echo "Metrics logged every eval:"
 echo "  loss/policy, loss/value, loss/entropy"
