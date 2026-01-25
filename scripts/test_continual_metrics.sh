@@ -21,7 +21,7 @@ echo ""
 
 # Run WITHOUT wandb first (fast path) to get baseline
 echo ">>> Testing FAST path (no wandb)..."
-time python scripts/bench_continual.py \
+time uv run python scripts/bench_continual.py \
     --configs pgx_baseline \
     --steps-per-game 100000 \
     --num-cycles 1 \
@@ -35,7 +35,7 @@ echo ">>> Testing METRICS path (with wandb, offline mode)..."
 
 # Run WITH wandb in offline mode (metrics path)
 export WANDB_MODE=offline
-time python scripts/bench_continual.py \
+time uv run python scripts/bench_continual.py \
     --configs pgx_baseline \
     --steps-per-game 100000 \
     --num-cycles 1 \
