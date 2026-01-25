@@ -1027,7 +1027,8 @@ class ContinualTrainer:
         return progress_callback
 
     def train_single_game(self, game_name: str, train_state, rng, cycle_idx: int,
-                          channel_perm: Optional[np.ndarray] = None):
+                          channel_perm: Optional[np.ndarray] = None,
+                          game_idx_in_cycle: int = 0):
         """Train on a single game, optionally continuing from existing train_state."""
         # Use cached PPO, train_chunk, and eval to avoid recompilation across cycles
         ppo, train_chunk, get_train_chunk_with_metrics, cached_eval = self._get_ppo_for_game(
@@ -1093,11 +1094,12 @@ class ContinualTrainer:
             if self.use_wandb:
                 import wandb
                 # Calculate cumulative step for Lyle-style plots
-                game_idx = GAME_ORDER.index(game_name)
+                # Use game_idx_in_cycle (position in shuffled/filtered order) not GAME_ORDER.index
+                num_games = len(self.game_list)
                 cumulative_step = (
-                    cycle_idx * len(GAME_ORDER) * self.steps_per_game +  # previous cycles
-                    game_idx * self.steps_per_game +                      # previous games this cycle
-                    current_steps                                          # current game progress
+                    cycle_idx * num_games * self.steps_per_game +  # previous cycles
+                    game_idx_in_cycle * self.steps_per_game +      # previous games this cycle
+                    current_steps                                   # current game progress
                 )
 
                 log_dict = {
@@ -1110,7 +1112,7 @@ class ContinualTrainer:
                     # Global tracking
                     "return": mean_return,
                     "cycle": cycle_idx,
-                    "game_idx": game_idx,
+                    "game_idx": game_idx_in_cycle,
                     "game": game_name,
                 }
 
@@ -1226,7 +1228,8 @@ class ContinualTrainer:
 
                 # Train on this game (PPO instances cached to avoid recompilation)
                 train_state, rng, game_result = self.train_single_game(
-                    game_name, train_state, rng, cycle_idx, channel_perm=channel_perm
+                    game_name, train_state, rng, cycle_idx,
+                    channel_perm=channel_perm, game_idx_in_cycle=game_idx
                 )
                 self.results["per_game_results"].append(game_result)
 
