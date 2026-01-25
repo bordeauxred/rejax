@@ -225,16 +225,18 @@ class PaddedMinAtarEnv:
     def _pad_obs(self, obs):
         """Pad observations from (10, 10, C) to (10, 10, 10).
 
-        If channel_perm is set, permutes channels before padding to prevent
-        memorization of fixed channel orderings in continual learning.
+        If channel_perm is set, permutes ALL 10 channels (including padding)
+        to prevent memorization of fixed channel positions. The network must
+        learn which channels contain content (have at least one non-zero pixel)
+        vs padding (all zeros).
         """
-        # Apply channel permutation before padding
-        if self.channel_perm is not None:
-            obs = obs[:, :, self.channel_perm]
-        # Then pad to unified channels
+        # First pad to unified channels
         if self.original_channels < UNIFIED_CHANNELS:
             pad_width = UNIFIED_CHANNELS - self.original_channels
             obs = jnp.pad(obs, ((0, 0), (0, 0), (0, pad_width)))
+        # Then apply channel permutation to all 10 channels
+        if self.channel_perm is not None:
+            obs = obs[:, :, self.channel_perm]
         return obs.astype(jnp.float32)
 
 
@@ -1092,7 +1094,12 @@ class ContinualTrainer:
         return eval_results, rng
 
     def _generate_channel_perm(self, game_name: str, cycle_idx: int) -> Optional[np.ndarray]:
-        """Generate a channel permutation for a game if permute_channels is enabled."""
+        """Generate a channel permutation for a game if permute_channels is enabled.
+
+        Always permutes all 10 unified channels (including padding zeros).
+        This forces the network to learn which channels contain content
+        (at least one non-zero pixel) vs padding (all zeros).
+        """
         if not self.permute_channels:
             return None
         # Use deterministic seed based on game, cycle, and base seed
@@ -1100,8 +1107,8 @@ class ContinualTrainer:
         game_idx = GAME_ORDER.index(game_name) if game_name in GAME_ORDER else 0
         perm_seed = abs(self.seed * 10000 + game_idx * 100 + cycle_idx) % (2**31)
         rng = np.random.default_rng(perm_seed)
-        num_channels = MINATAR_GAMES[game_name]["channels"]
-        perm = rng.permutation(num_channels)
+        # Always permute all 10 unified channels (content + padding)
+        perm = rng.permutation(UNIFIED_CHANNELS)
         return perm
 
     def run(self, rng, start_cycle: int = 0, start_game: int = 0, initial_train_state=None):
