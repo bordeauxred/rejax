@@ -340,6 +340,8 @@ def create_ppo_config(
     l2_init_coeff: Optional[float] = None,  # L2-Init regularization coefficient
     nap_enabled: bool = False,  # NaP (Normalize-and-Project)
     use_nap_layernorm: bool = False,  # NaP: LayerNorm before activations (non-learnable)
+    scale_enabled: bool = False,  # Scale-AdaMO: per-layer learnable α
+    scale_reg_coeff: Optional[float] = 0.01,  # Scale-AdaMO: log(α)² regularization
 ) -> Dict:
     """Create PPO configuration dict."""
     if network_type == "cnn":
@@ -399,6 +401,12 @@ def create_ppo_config(
     # NaP (Normalize-and-Project)
     if nap_enabled:
         config["nap_enabled"] = True
+
+    # Scale-AdaMO (per-layer learnable scaling)
+    if scale_enabled:
+        config["scale_enabled"] = True
+        if scale_reg_coeff is not None:
+            config["scale_reg_coeff"] = scale_reg_coeff
 
     # Calculate total gradient steps per game (used by multiple schedules)
     iteration_steps = num_envs * num_steps
@@ -660,6 +668,46 @@ EXPERIMENT_CONFIGS_MLP = [
         "learning_rate": 2.5e-4,
         "num_minibatches": 128,
         "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    # ==========================================================================
+    # Scale-AdaMO: AdaMO with per-layer learnable scaling
+    # ==========================================================================
+    # Scale-AdaMO addresses the "scaling bottleneck" in orthonormal networks:
+    # - Hidden layers are orthonormalized (W@W.T ≈ I), preserving signal magnitude
+    # - Output layer is the ONLY layer that can scale outputs
+    # - Different games have different return magnitudes (2-150x range)
+    # - Per-layer learnable α allows scaling to be distributed across layers
+    #   while maintaining orthonormality benefits (stable gradients, feature preservation)
+    {
+        "name": "mlp_scale_adamo",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "scale_enabled": True,
+        "scale_reg_coeff": 0.01,  # log(α)² regularization to keep α near 1
+        "activation": "groupsort",  # 1-Lipschitz activation
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": False,
+        "use_orthogonal_init": True,
+    },
+    # Scale-AdaMO with small network (64x4) for faster experiments
+    {
+        "name": "mlp_scale_adamo_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "scale_enabled": True,
+        "scale_reg_coeff": 0.01,
+        "activation": "groupsort",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": False,
         "use_orthogonal_init": True,
     },
 ]
@@ -1026,6 +1074,8 @@ class ContinualTrainer:
             l2_init_coeff=self.experiment_config.get("l2_init_coeff"),
             nap_enabled=self.experiment_config.get("nap_enabled", False),
             use_nap_layernorm=self.experiment_config.get("use_nap_layernorm", False),
+            scale_enabled=self.experiment_config.get("scale_enabled", False),
+            scale_reg_coeff=self.experiment_config.get("scale_reg_coeff", 0.01),
         )
         return PPO.create(**config)
 
@@ -1381,6 +1431,8 @@ def create_ppo_for_game_with_config(
         l2_init_coeff=experiment_config.get("l2_init_coeff"),
         nap_enabled=experiment_config.get("nap_enabled", False),
         use_nap_layernorm=experiment_config.get("use_nap_layernorm", False),
+        scale_enabled=experiment_config.get("scale_enabled", False),
+        scale_reg_coeff=experiment_config.get("scale_reg_coeff", 0.01),
     )
     return PPO.create(**config)
 
