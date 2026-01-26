@@ -87,7 +87,7 @@ uv run python scripts/bench_continual.py \
     --num-seeds $NUM_SEEDS \
     --num-envs $NUM_ENVS \
     --eval-freq $EVAL_FREQ \
-    --configs mlp_baseline_small mlp_adamo_small mlp_scale_adamo_small \
+    --configs mlp_scale_adamo_small \
     --permute-channels \
     --random-game-order \
     --exclude-games Seaquest-MinAtar \
