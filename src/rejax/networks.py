@@ -112,6 +112,7 @@ class CNN(nn.Module):
     use_bias: bool = True
     use_orthogonal_init: bool = True
     use_nap_layernorm: bool = False  # NaP: LayerNorm before activations (non-learnable)
+    use_learnable_scale: bool = False  # Scale-AdaMO: per-layer learnable α
 
     @nn.compact
     def __call__(self, x):
@@ -135,6 +136,10 @@ class CNN(nn.Module):
                 padding="VALID",
                 use_bias=self.use_bias,
             )(x)
+        # Scale-AdaMO: learnable scale for conv layer
+        if self.use_learnable_scale:
+            alpha_conv = self.param('scale_conv', nn.initializers.ones, (1,))
+            x = x * alpha_conv
         # NaP: LayerNorm before activation (fixed scale=1, offset=0)
         if self.use_nap_layernorm:
             x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
@@ -144,7 +149,7 @@ class CNN(nn.Module):
         x = x.reshape((x.shape[0], -1))
 
         # MLP layers (4x256 default for AdaMO research)
-        for size in self.mlp_hidden_sizes:
+        for i, size in enumerate(self.mlp_hidden_sizes):
             if self.use_orthogonal_init:
                 x = nn.Dense(
                     size,
@@ -154,6 +159,10 @@ class CNN(nn.Module):
                 )(x)
             else:
                 x = nn.Dense(size, use_bias=self.use_bias)(x)
+            # Scale-AdaMO: learnable scale for this MLP layer
+            if self.use_learnable_scale:
+                alpha = self.param(f'scale_{i}', nn.initializers.ones, (1,))
+                x = x * alpha
             # NaP: LayerNorm before activation (fixed scale=1, offset=0)
             if self.use_nap_layernorm:
                 x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
@@ -180,6 +189,7 @@ class DiscreteCNNPolicy(nn.Module):
     use_bias: bool = True
     use_orthogonal_init: bool = True  # CleanRL uses orthogonal init
     use_nap_layernorm: bool = False
+    use_learnable_scale: bool = False  # Scale-AdaMO: per-layer learnable α
 
     def setup(self):
         self.features = CNN(
@@ -190,6 +200,7 @@ class DiscreteCNNPolicy(nn.Module):
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
             use_nap_layernorm=self.use_nap_layernorm,
+            use_learnable_scale=self.use_learnable_scale,
         )
         if self.use_orthogonal_init:
             # Small scale (0.01) for action output - critical for stability
@@ -243,6 +254,7 @@ class CNNVNetwork(nn.Module):
     use_bias: bool = True
     use_orthogonal_init: bool = True  # CleanRL uses orthogonal init
     use_nap_layernorm: bool = False
+    use_learnable_scale: bool = False  # Scale-AdaMO: per-layer learnable α
 
     @nn.compact
     def __call__(self, obs):
@@ -251,6 +263,7 @@ class CNNVNetwork(nn.Module):
             mlp_hidden_sizes=self.mlp_hidden_sizes,
             activation=self.activation,
             kernel_size=self.kernel_size,
+            use_learnable_scale=self.use_learnable_scale,
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
             use_nap_layernorm=self.use_nap_layernorm,
@@ -272,11 +285,12 @@ class MLP(nn.Module):
     use_bias: bool = True
     use_orthogonal_init: bool = False
     use_nap_layernorm: bool = False  # NaP: LayerNorm before activations (non-learnable)
+    use_learnable_scale: bool = False  # Scale-AdaMO: per-layer learnable α
 
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
-        for size in self.hidden_layer_sizes:
+        for i, size in enumerate(self.hidden_layer_sizes):
             if self.use_orthogonal_init:
                 x = nn.Dense(
                     size,
@@ -286,6 +300,10 @@ class MLP(nn.Module):
                 )(x)
             else:
                 x = nn.Dense(size, use_bias=self.use_bias)(x)
+            # Scale-AdaMO: learnable scale for this layer
+            if self.use_learnable_scale:
+                alpha = self.param(f'scale_{i}', nn.initializers.ones, (1,))
+                x = x * alpha
             # NaP: LayerNorm before activation (fixed scale=1, offset=0)
             if self.use_nap_layernorm:
                 x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
@@ -303,6 +321,7 @@ class DiscretePolicy(nn.Module):
     use_bias: bool = True
     use_orthogonal_init: bool = False
     use_nap_layernorm: bool = False
+    use_learnable_scale: bool = False  # Scale-AdaMO: per-layer learnable α
 
     def setup(self):
         self.features = MLP(
@@ -311,6 +330,7 @@ class DiscretePolicy(nn.Module):
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
             use_nap_layernorm=self.use_nap_layernorm,
+            use_learnable_scale=self.use_learnable_scale,
         )
         if self.use_orthogonal_init:
             # Small scale (0.01) for action output - critical for stability
@@ -369,6 +389,7 @@ class GaussianPolicy(nn.Module):
     use_bias: bool = True
     use_orthogonal_init: bool = False
     use_nap_layernorm: bool = False
+    use_learnable_scale: bool = False  # Scale-AdaMO: per-layer learnable α
 
     def setup(self):
         self.features = MLP(
@@ -377,6 +398,7 @@ class GaussianPolicy(nn.Module):
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
             use_nap_layernorm=self.use_nap_layernorm,
+            use_learnable_scale=self.use_learnable_scale,
         )
         if self.use_orthogonal_init:
             # Small scale (0.01) for action output - critical for stability

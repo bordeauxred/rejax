@@ -30,6 +30,7 @@ from rejax.regularization import (
     compute_l2_init_loss,
     compute_weight_norms,
     apply_nap_projection,
+    compute_scale_regularization_loss,
 )
 
 
@@ -77,6 +78,11 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     nap_enabled: bool = struct.field(pytree_node=False, default=False)
     nap_exclude_output: bool = struct.field(pytree_node=False, default=True)
 
+    # Scale-AdaMO settings (per-layer learnable scaling)
+    scale_enabled: bool = struct.field(pytree_node=False, default=False)
+    scale_reg_coeff: Optional[chex.Scalar] = struct.field(pytree_node=True, default=0.01)  # log(α)² regularization
+    scale_exclude_output: bool = struct.field(pytree_node=False, default=True)
+
     def make_act(self, ts):
         def act(obs, rng):
             if getattr(self, "normalize_observations", False):
@@ -95,6 +101,11 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
 
         agent_kwargs = config.pop("agent_kwargs", {})
+
+        # Scale-AdaMO: if scale_enabled, pass use_learnable_scale to networks
+        scale_enabled = config.get("scale_enabled", False)
+        if scale_enabled and "use_learnable_scale" not in agent_kwargs:
+            agent_kwargs["use_learnable_scale"] = True
 
         # Network type: "auto", "mlp", or "cnn"
         network_type = agent_kwargs.pop("network_type", "auto")
@@ -292,6 +303,22 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         final_metrics["l2_init/actor_distance"] = actor_l2_metrics["l2_init/total_distance"]
         final_metrics["l2_init/critic_distance"] = critic_l2_metrics["l2_init/total_distance"]
 
+        # Compute scale metrics if scale-adamo is enabled
+        if self.scale_enabled:
+            _, actor_scale_metrics = compute_scale_regularization_loss(
+                ts.actor_ts.params, reg_coeff=1.0
+            )
+            _, critic_scale_metrics = compute_scale_regularization_loss(
+                ts.critic_ts.params, reg_coeff=1.0
+            )
+            # Log aggregate scale metrics
+            if "scale/mean" in actor_scale_metrics:
+                final_metrics["scale/actor_mean"] = actor_scale_metrics["scale/mean"]
+                final_metrics["scale/actor_lipschitz"] = actor_scale_metrics["scale/lipschitz"]
+            if "scale/mean" in critic_scale_metrics:
+                final_metrics["scale/critic_mean"] = critic_scale_metrics["scale/mean"]
+                final_metrics["scale/critic_lipschitz"] = critic_scale_metrics["scale/lipschitz"]
+
         # Compute current learning rate
         final_metrics["train/learning_rate"] = self._get_current_lr(ts.actor_ts.step)
 
@@ -431,6 +458,15 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                 )
                 total_loss = total_loss + l2_loss
 
+            # Add scale regularization if enabled
+            if self.scale_enabled and self.scale_reg_coeff is not None:
+                scale_loss, _ = compute_scale_regularization_loss(
+                    params,
+                    reg_coeff=self.scale_reg_coeff,
+                    exclude_output=self.scale_exclude_output,
+                )
+                total_loss = total_loss + scale_loss
+
             return total_loss, (pi_loss, entropy, approx_kl, clip_fraction)
 
         grads, (pi_loss, entropy, approx_kl, clip_fraction) = jax.grad(
@@ -495,6 +531,15 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                     exclude_output=self.l2_init_exclude_output,
                 )
                 total_loss = total_loss + l2_loss
+
+            # Add scale regularization if enabled
+            if self.scale_enabled and self.scale_reg_coeff is not None:
+                scale_loss, _ = compute_scale_regularization_loss(
+                    params,
+                    reg_coeff=self.scale_reg_coeff,
+                    exclude_output=self.scale_exclude_output,
+                )
+                total_loss = total_loss + scale_loss
 
             return total_loss, value_loss
 

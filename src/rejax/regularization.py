@@ -476,6 +476,86 @@ def compute_l2_init_loss(
 
 
 # =============================================================================
+# Scale-AdaMO: Per-layer learnable scaling
+# =============================================================================
+
+def get_scale_params(params: Dict) -> Dict[str, jnp.ndarray]:
+    """
+    Extract all scale parameters from a parameter dict.
+
+    Scale parameters are named 'scale_*' (e.g., 'scale_0', 'scale_1', 'scale_conv').
+
+    Args:
+        params: Parameter dictionary (PyTree)
+
+    Returns:
+        Dictionary mapping flattened paths to scale parameter arrays
+    """
+    flat_params = flatten_dict(params, sep="/")
+    scales = {}
+
+    for key_path, value in flat_params.items():
+        # Match scale parameters (scale_0, scale_1, scale_conv, etc.)
+        parts = key_path.split('/')
+        if any(part.startswith('scale_') or part == 'scale' for part in parts):
+            scales[key_path] = value
+
+    return scales
+
+
+def compute_scale_regularization_loss(
+    params: Dict,
+    reg_coeff: float = 0.01,
+    exclude_output: bool = True,
+) -> Tuple[jnp.ndarray, Dict[str, Any]]:
+    """
+    Compute log(α)² regularization to encourage α ≈ 1.
+
+    This regularization prevents scale parameters from collapsing to 0
+    or exploding to large values, while allowing the network to learn
+    appropriate scaling for different reward magnitudes.
+
+    Args:
+        params: Parameter dictionary (PyTree)
+        reg_coeff: Regularization coefficient (default: 0.01)
+        exclude_output: Whether to exclude output layer scales (unused for scale params)
+
+    Returns:
+        (weighted_loss, metrics): The weighted loss and diagnostic metrics
+    """
+    scales = get_scale_params(params)
+
+    total_loss = jnp.array(0.0)
+    metrics = {}
+    scale_values = []
+
+    for path, alpha in scales.items():
+        # log(α)² encourages α near 1, penalizes extreme values
+        # Use absolute value to handle negative scales (shouldn't happen but safety)
+        layer_loss = jnp.sum(jnp.log(jnp.abs(alpha) + 1e-8) ** 2)
+        total_loss = total_loss + layer_loss
+
+        # Per-layer metrics
+        metric_name = path.replace('/', '_')
+        metrics[f"scale/{metric_name}"] = jnp.mean(alpha)
+        scale_values.append(jnp.mean(alpha))
+
+    # Aggregate metrics
+    if scale_values:
+        scale_array = jnp.array(scale_values)
+        metrics["scale/mean"] = jnp.mean(scale_array)
+        metrics["scale/min"] = jnp.min(scale_array)
+        metrics["scale/max"] = jnp.max(scale_array)
+        # Total Lipschitz contribution from scales: product of all α
+        metrics["scale/lipschitz"] = jnp.prod(scale_array)
+
+    metrics["scale/reg_loss"] = total_loss
+    weighted_loss = reg_coeff * total_loss
+
+    return weighted_loss, metrics
+
+
+# =============================================================================
 # NaP (Normalize-and-Project)
 # =============================================================================
 

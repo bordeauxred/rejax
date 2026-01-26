@@ -648,6 +648,20 @@ EXPERIMENT_CONFIGS_MLP = [
         "use_bias": True,
         "use_orthogonal_init": True,
     },
+    # NaP with small network (64x4) for faster experiments
+    {
+        "name": "mlp_nap_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "nap_enabled": True,
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
 ]
 
 # =============================================================================
