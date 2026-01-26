@@ -518,11 +518,11 @@ EXPERIMENT_CONFIGS_MLP = [
         "use_bias": False,
         "use_orthogonal_init": True,
     },
-    # Small network variants for Experiment 1 (reduced capacity ablation)
+    # Small network variants - 64x4 (deeper, more plasticity stress)
     {
         "name": "mlp_baseline_small",
         "network_type": "mlp",
-        "hidden_layer_sizes": (64, 64, 64),  # 3 layers, small
+        "hidden_layer_sizes": (64, 64, 64, 64),
         "ortho_mode": None,
         "activation": "relu",
         "lr_schedule": "constant",
@@ -533,6 +533,32 @@ EXPERIMENT_CONFIGS_MLP = [
     },
     {
         "name": "mlp_adamo_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "groupsort",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": False,
+        "use_orthogonal_init": True,
+    },
+    # Small network variants - 64x3 (shallower alternative)
+    {
+        "name": "mlp_baseline_small3",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64),
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    {
+        "name": "mlp_adamo_small3",
         "network_type": "mlp",
         "hidden_layer_sizes": (64, 64, 64),
         "ortho_mode": "optimizer",
