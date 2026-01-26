@@ -37,7 +37,7 @@ EVAL_FREQ=${5:-500000}
 EXPERIMENT_NAME="continual_exp5_nap_$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="results/${EXPERIMENT_NAME}"
 CHECKPOINT_DIR="checkpoints/${EXPERIMENT_NAME}"
-WANDB_PROJECT="continual_minatar_permutations"  # Same as exp2 for comparison
+WANDB_PROJECT="continual_minatar_small_permuted"  # Same as other 64x4 experiments
 
 echo "=============================================================="
 echo "EXPERIMENT 5: NaP (NORMALIZE-AND-PROJECT) + PERMUTATIONS"
