@@ -24,7 +24,13 @@ from rejax.networks import (
     DiscreteCNNPolicy,
     CNNVNetwork,
 )
-from rejax.regularization import compute_gram_regularization_loss, apply_ortho_update, compute_l2_init_loss
+from rejax.regularization import (
+    compute_gram_regularization_loss,
+    apply_ortho_update,
+    compute_l2_init_loss,
+    compute_weight_norms,
+    apply_nap_projection,
+)
 
 
 class Trajectory(struct.PyTreeNode):
@@ -66,6 +72,10 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     # L2-Init regularization settings (regenerative regularization)
     l2_init_coeff: Optional[chex.Scalar] = struct.field(pytree_node=True, default=None)  # None = disabled
     l2_init_exclude_output: bool = struct.field(pytree_node=False, default=True)
+
+    # NaP (Normalize-and-Project) settings
+    nap_enabled: bool = struct.field(pytree_node=False, default=False)
+    nap_exclude_output: bool = struct.field(pytree_node=False, default=True)
 
     def make_act(self, ts):
         def act(obs, rng):
@@ -197,11 +207,18 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         actor_init_params = jax.tree.map(lambda x: x, actor_params)
         critic_init_params = jax.tree.map(lambda x: x, critic_params)
 
+        # Store initial weight norms for NaP (Normalize-and-Project)
+        # These are used to project weights back to their initial norms
+        actor_init_norms = compute_weight_norms(actor_params, exclude_output=self.nap_exclude_output)
+        critic_init_norms = compute_weight_norms(critic_params, exclude_output=self.nap_exclude_output)
+
         return {
             "actor_ts": actor_ts,
             "critic_ts": critic_ts,
             "actor_init_params": actor_init_params,
             "critic_init_params": critic_init_params,
+            "actor_init_norms": actor_init_norms,
+            "critic_init_norms": critic_init_norms,
         }
 
     def train_iteration(self, ts):
@@ -431,6 +448,15 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             )
             new_actor_ts = new_actor_ts.replace(params=new_params)
 
+        # Apply NaP projection if enabled (after gradient and ortho updates)
+        if self.nap_enabled:
+            new_params = apply_nap_projection(
+                new_actor_ts.params,
+                ts.actor_init_norms,
+                exclude_output=self.nap_exclude_output,
+            )
+            new_actor_ts = new_actor_ts.replace(params=new_params)
+
         metrics = {
             "loss/policy": pi_loss,
             "loss/entropy": entropy,
@@ -482,6 +508,15 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                 lr=self.learning_rate,
                 ortho_coeff=self.ortho_coeff,
                 exclude_output=self.ortho_exclude_output,
+            )
+            new_critic_ts = new_critic_ts.replace(params=new_params)
+
+        # Apply NaP projection if enabled (after gradient and ortho updates)
+        if self.nap_enabled:
+            new_params = apply_nap_projection(
+                new_critic_ts.params,
+                ts.critic_init_norms,
+                exclude_output=self.nap_exclude_output,
             )
             new_critic_ts = new_critic_ts.replace(params=new_params)
 

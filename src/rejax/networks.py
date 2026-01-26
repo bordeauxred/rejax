@@ -111,6 +111,7 @@ class CNN(nn.Module):
     kernel_size: int = 3
     use_bias: bool = True
     use_orthogonal_init: bool = True
+    use_nap_layernorm: bool = False  # NaP: LayerNorm before activations (non-learnable)
 
     @nn.compact
     def __call__(self, x):
@@ -134,6 +135,9 @@ class CNN(nn.Module):
                 padding="VALID",
                 use_bias=self.use_bias,
             )(x)
+        # NaP: LayerNorm before activation (fixed scale=1, offset=0)
+        if self.use_nap_layernorm:
+            x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
         x = self.activation(x)
 
         # Flatten: 8*8*16 = 1024
@@ -150,6 +154,9 @@ class CNN(nn.Module):
                 )(x)
             else:
                 x = nn.Dense(size, use_bias=self.use_bias)(x)
+            # NaP: LayerNorm before activation (fixed scale=1, offset=0)
+            if self.use_nap_layernorm:
+                x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
             x = self.activation(x)
 
         return x
@@ -172,6 +179,7 @@ class DiscreteCNNPolicy(nn.Module):
     kernel_size: int = 3
     use_bias: bool = True
     use_orthogonal_init: bool = True  # CleanRL uses orthogonal init
+    use_nap_layernorm: bool = False
 
     def setup(self):
         self.features = CNN(
@@ -181,6 +189,7 @@ class DiscreteCNNPolicy(nn.Module):
             kernel_size=self.kernel_size,
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
+            use_nap_layernorm=self.use_nap_layernorm,
         )
         if self.use_orthogonal_init:
             # Small scale (0.01) for action output - critical for stability
@@ -233,6 +242,7 @@ class CNNVNetwork(nn.Module):
     kernel_size: int = 3
     use_bias: bool = True
     use_orthogonal_init: bool = True  # CleanRL uses orthogonal init
+    use_nap_layernorm: bool = False
 
     @nn.compact
     def __call__(self, obs):
@@ -243,6 +253,7 @@ class CNNVNetwork(nn.Module):
             kernel_size=self.kernel_size,
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
+            use_nap_layernorm=self.use_nap_layernorm,
         )(obs)
 
         if self.use_orthogonal_init:
@@ -260,6 +271,7 @@ class MLP(nn.Module):
     activation: Callable
     use_bias: bool = True
     use_orthogonal_init: bool = False
+    use_nap_layernorm: bool = False  # NaP: LayerNorm before activations (non-learnable)
 
     @nn.compact
     def __call__(self, x):
@@ -274,6 +286,9 @@ class MLP(nn.Module):
                 )(x)
             else:
                 x = nn.Dense(size, use_bias=self.use_bias)(x)
+            # NaP: LayerNorm before activation (fixed scale=1, offset=0)
+            if self.use_nap_layernorm:
+                x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
             x = self.activation(x)
         return x
 
@@ -287,6 +302,7 @@ class DiscretePolicy(nn.Module):
     activation: Callable
     use_bias: bool = True
     use_orthogonal_init: bool = False
+    use_nap_layernorm: bool = False
 
     def setup(self):
         self.features = MLP(
@@ -294,6 +310,7 @@ class DiscretePolicy(nn.Module):
             self.activation,
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
+            use_nap_layernorm=self.use_nap_layernorm,
         )
         if self.use_orthogonal_init:
             # Small scale (0.01) for action output - critical for stability
@@ -351,6 +368,7 @@ class GaussianPolicy(nn.Module):
     activation: Callable
     use_bias: bool = True
     use_orthogonal_init: bool = False
+    use_nap_layernorm: bool = False
 
     def setup(self):
         self.features = MLP(
@@ -358,6 +376,7 @@ class GaussianPolicy(nn.Module):
             self.activation,
             use_bias=self.use_bias,
             use_orthogonal_init=self.use_orthogonal_init,
+            use_nap_layernorm=self.use_nap_layernorm,
         )
         if self.use_orthogonal_init:
             # Small scale (0.01) for action output - critical for stability

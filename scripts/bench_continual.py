@@ -338,6 +338,8 @@ def create_ppo_config(
     conv_channels: int = 16,
     anneal_lr: bool = False,
     l2_init_coeff: Optional[float] = None,  # L2-Init regularization coefficient
+    nap_enabled: bool = False,  # NaP (Normalize-and-Project)
+    use_nap_layernorm: bool = False,  # NaP: LayerNorm before activations (non-learnable)
 ) -> Dict:
     """Create PPO configuration dict."""
     if network_type == "cnn":
@@ -352,6 +354,7 @@ def create_ppo_config(
             "activation": activation,
             "use_bias": use_bias,
             "use_orthogonal_init": use_orthogonal_init,
+            "use_nap_layernorm": use_nap_layernorm,
         }
     else:
         # MLP architecture (configurable, default: 4x256 per Lyle et al.)
@@ -361,6 +364,7 @@ def create_ppo_config(
             "activation": activation,
             "use_bias": use_bias,
             "use_orthogonal_init": use_orthogonal_init,
+            "use_nap_layernorm": use_nap_layernorm,
         }
 
     config = {
@@ -391,6 +395,10 @@ def create_ppo_config(
     # L2-Init regularization
     if l2_init_coeff is not None:
         config["l2_init_coeff"] = l2_init_coeff
+
+    # NaP (Normalize-and-Project)
+    if nap_enabled:
+        config["nap_enabled"] = True
 
     # Calculate total gradient steps per game (used by multiple schedules)
     iteration_steps = num_envs * num_steps
@@ -618,6 +626,20 @@ EXPERIMENT_CONFIGS_MLP = [
         "network_type": "mlp",
         "hidden_layer_sizes": (64, 64, 64),
         "l2_init_coeff": 0.001,
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    # NaP (Normalize-and-Project) baselines
+    {
+        "name": "mlp_nap",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "nap_enabled": True,
         "ortho_mode": None,
         "activation": "relu",
         "lr_schedule": "constant",
@@ -988,6 +1010,8 @@ class ContinualTrainer:
             conv_channels=self.experiment_config.get("conv_channels", 32),
             anneal_lr=self.experiment_config.get("anneal_lr", False),
             l2_init_coeff=self.experiment_config.get("l2_init_coeff"),
+            nap_enabled=self.experiment_config.get("nap_enabled", False),
+            use_nap_layernorm=self.experiment_config.get("use_nap_layernorm", False),
         )
         return PPO.create(**config)
 
@@ -1022,6 +1046,9 @@ class ContinualTrainer:
             # Preserve original init_params for L2-Init regularization
             actor_init_params=old_ts.actor_init_params,
             critic_init_params=old_ts.critic_init_params,
+            # Preserve original init_norms for NaP
+            actor_init_norms=old_ts.actor_init_norms,
+            critic_init_norms=old_ts.critic_init_norms,
         )
         return new_ts
 
@@ -1338,6 +1365,8 @@ def create_ppo_for_game_with_config(
         conv_channels=experiment_config.get("conv_channels", 32),
         anneal_lr=experiment_config.get("anneal_lr", False),
         l2_init_coeff=experiment_config.get("l2_init_coeff"),
+        nap_enabled=experiment_config.get("nap_enabled", False),
+        use_nap_layernorm=experiment_config.get("use_nap_layernorm", False),
     )
     return PPO.create(**config)
 
