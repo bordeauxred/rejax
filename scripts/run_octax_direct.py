@@ -28,11 +28,13 @@ except ImportError:
     from octax.wrappers import OctaxGymnaxWrapper
 
 
-def run_octax_ppo(game: str, num_seeds: int = 2, total_timesteps: int = 5_000_000):
+def run_octax_ppo(game: str, num_seeds: int = 2, total_timesteps: int = 5_000_000,
+                   hidden_layers: tuple = (256,)):
     """Run octax's own PPO implementation."""
     print(f"\n{'='*60}")
     print(f"Running Octax PPO on {game}")
     print(f"Seeds: {num_seeds}, Steps: {total_timesteps:,}")
+    print(f"MLP: {hidden_layers}")
     print(f"{'='*60}")
 
     # Create env exactly like they do
@@ -55,6 +57,7 @@ def run_octax_ppo(game: str, num_seeds: int = 2, total_timesteps: int = 5_000_00
         'ent_coef': 0.01,
         'vf_coef': 0.5,
         'max_grad_norm': 0.5,
+        'agent_kwargs': {'hidden_layer_sizes': hidden_layers},
     }
 
     # Create agent exactly like they do
@@ -104,6 +107,14 @@ if __name__ == "__main__":
     parser.add_argument('--game', default='brix')
     parser.add_argument('--seeds', type=int, default=2)
     parser.add_argument('--steps', type=int, default=5_000_000)
+    parser.add_argument('--mlp', default='256', help='MLP config: "256" for (256,), "256x4" for (256,256,256,256)')
     args = parser.parse_args()
 
-    run_octax_ppo(args.game, args.seeds, args.steps)
+    # Parse MLP config
+    if 'x' in args.mlp:
+        width, depth = args.mlp.split('x')
+        hidden_layers = tuple([int(width)] * int(depth))
+    else:
+        hidden_layers = (int(args.mlp),)
+
+    run_octax_ppo(args.game, args.seeds, args.steps, hidden_layers)
