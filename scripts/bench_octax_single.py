@@ -133,9 +133,9 @@ def create_ppo_config(
     env,
     env_params,
     total_timesteps: int,
-    num_envs: int = 2048,
+    num_envs: int = 512,  # Octax paper default (scales to 8192)
     num_steps: int = 32,  # Octax paper default
-    num_epochs: int = 4,
+    num_epochs: int = 8,  # Octax paper default (NOT 4!)
     num_minibatches: int = 32,
     learning_rate: float = 5e-4,  # Octax paper default
     gamma: float = 0.99,
@@ -144,7 +144,7 @@ def create_ppo_config(
     ent_coef: float = 0.01,
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
-    mlp_hidden_sizes: Tuple[int, ...] = (256, 256, 256, 256),
+    mlp_hidden_sizes: Tuple[int, ...] = (256,),  # Paper default: SINGLE layer
     activation: str = "relu",
     normalize_observations: bool = False,
     normalize_rewards: bool = False,
@@ -219,39 +219,61 @@ def create_ppo_config(
 # =============================================================================
 
 EXPERIMENT_CONFIGS = {
-    # Paper-style: 4x256 MLP head
+    # ==========================================================================
+    # Paper-exact config: SINGLE 256-unit MLP layer, 8 epochs (arXiv 2510.01764)
+    # ==========================================================================
+    "paper_256x1": {
+        "mlp_hidden_sizes": (256,),  # Paper uses SINGLE layer!
+        "activation": "relu",
+        "num_epochs": 8,  # Paper default
+    },
+    # ==========================================================================
+    # Deep MLPs for AdaMO plasticity research (4 layers)
+    # ==========================================================================
     "256x4": {
         "mlp_hidden_sizes": (256, 256, 256, 256),
         "activation": "relu",
+        "num_epochs": 8,
     },
-    # Smaller: 4x64 MLP head (faster, more plasticity stress)
     "64x4": {
         "mlp_hidden_sizes": (64, 64, 64, 64),
         "activation": "relu",
+        "num_epochs": 8,
     },
     # AdaMo variants
+    "adamo_256x1": {
+        "mlp_hidden_sizes": (256,),  # Paper-style single layer
+        "activation": "groupsort",
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "num_epochs": 8,
+    },
     "adamo_256x4": {
         "mlp_hidden_sizes": (256, 256, 256, 256),
         "activation": "groupsort",
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
+        "num_epochs": 8,
     },
     "adamo_64x4": {
         "mlp_hidden_sizes": (64, 64, 64, 64),
         "activation": "groupsort",
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
+        "num_epochs": 8,
     },
     # Plasticity baselines
     "l2_init_256x4": {
         "mlp_hidden_sizes": (256, 256, 256, 256),
         "activation": "relu",
         "l2_init_coeff": 0.001,
+        "num_epochs": 8,
     },
     "nap_256x4": {
         "mlp_hidden_sizes": (256, 256, 256, 256),
         "activation": "relu",
         "nap_enabled": True,
+        "num_epochs": 8,
     },
     "scale_adamo_256x4": {
         "mlp_hidden_sizes": (256, 256, 256, 256),
@@ -260,6 +282,7 @@ EXPERIMENT_CONFIGS = {
         "ortho_coeff": 0.1,
         "scale_enabled": True,
         "scale_reg_coeff": 0.01,
+        "num_epochs": 8,
     },
 }
 
@@ -471,9 +494,9 @@ def main():
                         help="Training steps")
     parser.add_argument("--num-seeds", type=int, default=3,
                         help="Number of random seeds")
-    parser.add_argument("--num-envs", type=int, default=2048,
-                        help="Parallel environments")
-    parser.add_argument("--config", type=str, default="256x4",
+    parser.add_argument("--num-envs", type=int, default=512,
+                        help="Parallel environments (paper default: 512)")
+    parser.add_argument("--config", type=str, default="paper_256x1",
                         choices=list(EXPERIMENT_CONFIGS.keys()),
                         help="Experiment configuration")
     parser.add_argument("--normalize-rewards", action="store_true",
