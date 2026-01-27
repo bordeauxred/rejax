@@ -32,6 +32,7 @@ for backend in ['spring', 'mjx']:
         print(f"  Training {NUM_TIMESTEPS:,} steps with {NUM_ENVS} envs...")
         start = time.time()
 
+        # Brax requires: batch_size * num_minibatches % num_envs == 0
         make_policy, params, metrics = ppo_train.train(
             environment=env,
             num_timesteps=NUM_TIMESTEPS,
@@ -40,6 +41,10 @@ for backend in ['spring', 'mjx']:
             num_evals=2,
             reward_scaling=10,
             normalize_observations=True,
+            batch_size=1024,
+            num_minibatches=32,  # 1024 * 32 = 32768, % 2048 = 0
+            unroll_length=10,
+            num_updates_per_batch=4,
         )
 
         elapsed = time.time() - start
