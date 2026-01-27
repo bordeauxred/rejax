@@ -10,6 +10,7 @@ _create_fns = {
     "gymnasium": ("rejax.compat.gymnasium2gymnax", "create_gymnasium"),
     "kinetix": ("rejax.compat.kinetix2gymnax", "create_kinetix"),
     "craftax": ("rejax.compat.craftax2gymnax", "create_craftax"),
+    "octax": ("rejax.compat.octax2gymnax", "create_octax"),
 }
 
 

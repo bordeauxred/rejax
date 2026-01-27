@@ -93,6 +93,161 @@ def parse_activation_fn(name: str):
 # CNN Feature Extractor and Networks
 
 
+class OctaxCNN(nn.Module):
+    """
+    CNN feature extractor for Octax (CHIP-8 games, 64x32 display with 4 frame stacking).
+
+    Architecture from arXiv 2510.01764:
+    - Conv1: 32 filters, kernel (8,4), stride (4,2) -> 15x15x32
+    - Conv2: 64 filters, kernel 4, stride 2 -> 6x6x64
+    - Conv3: 64 filters, kernel 3, stride 1 -> 4x4x64
+    - Flatten -> 1024
+    - MLP: configurable depth (default 4x256 for AdaMO research)
+
+    Input shape: (batch, 64, 32, 4) - HWC format after transpose from octax wrapper
+    """
+    conv_channels: tuple[int, int, int] = (32, 64, 64)
+    mlp_hidden_sizes: Sequence[int] = (256, 256, 256, 256)
+    activation: Callable = nn.relu
+    use_bias: bool = True
+    use_orthogonal_init: bool = True
+    use_nap_layernorm: bool = False
+    use_learnable_scale: bool = False
+
+    @nn.compact
+    def __call__(self, x):
+        # Conv1: 32 filters, kernel (8,4), stride (4,2)
+        if self.use_orthogonal_init:
+            x = nn.Conv(self.conv_channels[0], kernel_size=(8, 4), strides=(4, 2),
+                       padding="VALID", use_bias=self.use_bias,
+                       kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        else:
+            x = nn.Conv(self.conv_channels[0], kernel_size=(8, 4), strides=(4, 2),
+                       padding="VALID", use_bias=self.use_bias)(x)
+        if self.use_learnable_scale:
+            x = x * self.param('scale_conv0', nn.initializers.ones, (1,))
+        if self.use_nap_layernorm:
+            x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
+        x = self.activation(x)
+
+        # Conv2: 64 filters, kernel 4, stride 2
+        if self.use_orthogonal_init:
+            x = nn.Conv(self.conv_channels[1], kernel_size=(4, 4), strides=(2, 2),
+                       padding="VALID", use_bias=self.use_bias,
+                       kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        else:
+            x = nn.Conv(self.conv_channels[1], kernel_size=(4, 4), strides=(2, 2),
+                       padding="VALID", use_bias=self.use_bias)(x)
+        if self.use_learnable_scale:
+            x = x * self.param('scale_conv1', nn.initializers.ones, (1,))
+        if self.use_nap_layernorm:
+            x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
+        x = self.activation(x)
+
+        # Conv3: 64 filters, kernel 3, stride 1
+        if self.use_orthogonal_init:
+            x = nn.Conv(self.conv_channels[2], kernel_size=(3, 3), strides=(1, 1),
+                       padding="VALID", use_bias=self.use_bias,
+                       kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        else:
+            x = nn.Conv(self.conv_channels[2], kernel_size=(3, 3), strides=(1, 1),
+                       padding="VALID", use_bias=self.use_bias)(x)
+        if self.use_learnable_scale:
+            x = x * self.param('scale_conv2', nn.initializers.ones, (1,))
+        if self.use_nap_layernorm:
+            x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
+        x = self.activation(x)
+
+        # Flatten
+        x = x.reshape((x.shape[0], -1))
+
+        # MLP layers
+        for i, size in enumerate(self.mlp_hidden_sizes):
+            if self.use_orthogonal_init:
+                x = nn.Dense(size, use_bias=self.use_bias,
+                            kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+            else:
+                x = nn.Dense(size, use_bias=self.use_bias)(x)
+            if self.use_learnable_scale:
+                x = x * self.param(f'scale_{i}', nn.initializers.ones, (1,))
+            if self.use_nap_layernorm:
+                x = nn.LayerNorm(use_scale=False, use_bias=False)(x)
+            x = self.activation(x)
+
+        return x
+
+
+class DiscreteOctaxCNNPolicy(nn.Module):
+    """Discrete policy with OctaxCNN backbone for Octax (64x32 images)."""
+    action_dim: int
+    conv_channels: tuple[int, int, int] = (32, 64, 64)
+    mlp_hidden_sizes: Sequence[int] = (256, 256, 256, 256)
+    activation: Callable = nn.relu
+    use_bias: bool = True
+    use_orthogonal_init: bool = True
+    use_nap_layernorm: bool = False
+    use_learnable_scale: bool = False
+
+    def setup(self):
+        self.features = OctaxCNN(
+            conv_channels=self.conv_channels, mlp_hidden_sizes=self.mlp_hidden_sizes,
+            activation=self.activation, use_bias=self.use_bias,
+            use_orthogonal_init=self.use_orthogonal_init,
+            use_nap_layernorm=self.use_nap_layernorm,
+            use_learnable_scale=self.use_learnable_scale,
+        )
+        if self.use_orthogonal_init:
+            self.action_logits = nn.Dense(self.action_dim, use_bias=self.use_bias,
+                                         kernel_init=orthogonal(0.01), bias_init=constant(0.0))
+        else:
+            self.action_logits = nn.Dense(self.action_dim, use_bias=self.use_bias)
+
+    def _action_dist(self, obs):
+        return distrax.Categorical(logits=self.action_logits(self.features(obs)))
+
+    def __call__(self, obs, rng):
+        dist = self._action_dist(obs)
+        action = dist.sample(seed=rng)
+        return action, dist.log_prob(action), dist.entropy()
+
+    def act(self, obs, rng):
+        return self._action_dist(obs).sample(seed=rng)
+
+    def log_prob_entropy(self, obs, action):
+        dist = self._action_dist(obs)
+        return dist.log_prob(action), dist.entropy()
+
+    def action_log_prob(self, obs, rng):
+        dist = self._action_dist(obs)
+        action = dist.sample(seed=rng)
+        return action, dist.log_prob(action)
+
+
+class OctaxCNNVNetwork(nn.Module):
+    """Value network with OctaxCNN backbone for Octax (64x32 images)."""
+    conv_channels: tuple[int, int, int] = (32, 64, 64)
+    mlp_hidden_sizes: Sequence[int] = (256, 256, 256, 256)
+    activation: Callable = nn.relu
+    use_bias: bool = True
+    use_orthogonal_init: bool = True
+    use_nap_layernorm: bool = False
+    use_learnable_scale: bool = False
+
+    @nn.compact
+    def __call__(self, obs):
+        x = OctaxCNN(
+            conv_channels=self.conv_channels, mlp_hidden_sizes=self.mlp_hidden_sizes,
+            activation=self.activation, use_bias=self.use_bias,
+            use_orthogonal_init=self.use_orthogonal_init,
+            use_nap_layernorm=self.use_nap_layernorm,
+            use_learnable_scale=self.use_learnable_scale,
+        )(obs)
+        if self.use_orthogonal_init:
+            return nn.Dense(1, use_bias=self.use_bias,
+                           kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x).squeeze(-1)
+        return nn.Dense(1, use_bias=self.use_bias)(x).squeeze(-1)
+
+
 class CNN(nn.Module):
     """
     CNN feature extractor for MinAtar (10x10 images).
