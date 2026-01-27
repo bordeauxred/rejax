@@ -755,6 +755,9 @@ def run_single_task(
     num_seeds: int = 3,
     num_envs: int = 2048,
     experiment_config: Optional[Dict] = None,
+    config_name: str = "baseline",
+    use_wandb: bool = False,
+    wandb_project: str = "rejax-brax-single",
 ):
     """Run PPO on a single Brax task with multiple seeds."""
     config = experiment_config or EXPERIMENT_CONFIGS["baseline"]
@@ -771,15 +774,44 @@ def run_single_task(
         unified_obs_size=unified_obs, unified_action_size=unified_act
     )
     print(f"Env: obs={env.original_obs_size}→{unified_obs}, action={env.original_action_size}→{unified_act}")
+
+    eval_freq = steps // 10
     ppo_config = create_brax_ppo_config(
         env=env,
         env_params=env_params,
         total_timesteps=steps,
         num_envs=num_envs,
-        eval_freq=steps // 10,
+        eval_freq=eval_freq,
         **config,
     )
     ppo = PPO.create(**ppo_config)
+
+    # Initialize wandb
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=wandb_project,
+            name=f"{task_name}_{config_name}",
+            config={
+                "task": task_name,
+                "backend": backend,
+                "steps": steps,
+                "num_seeds": num_seeds,
+                "num_envs": num_envs,
+                "config_name": config_name,
+                "eval_freq": eval_freq,
+                **config,
+                # PPO defaults
+                "learning_rate": ppo.learning_rate,
+                "gamma": ppo.gamma,
+                "num_steps": ppo.num_steps,
+                "num_epochs": ppo.num_epochs,
+                "num_minibatches": ppo.num_minibatches,
+                "ent_coef": ppo.ent_coef,
+                "clip_eps": ppo.clip_eps,
+            },
+            reinit=True,
+        )
 
     # Compile
     print("Compiling...", end=" ", flush=True)
@@ -788,7 +820,8 @@ def run_single_task(
     vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
     train_states, _ = vmap_train(ppo, keys)
     jax.block_until_ready(train_states)
-    print(f"{time.time() - compile_start:.1f}s")
+    compile_time = time.time() - compile_start
+    print(f"{compile_time:.1f}s")
 
     # Benchmark
     print("Running...", end=" ", flush=True)
@@ -800,25 +833,58 @@ def run_single_task(
     _, returns = eval_data
     # returns: (num_seeds, num_evals, num_episodes) or (num_seeds, num_episodes)
     if returns.ndim == 3:
+        # Log training curves to wandb
+        num_evals = returns.shape[1]
+        for eval_idx in range(num_evals):
+            eval_step = (eval_idx + 1) * eval_freq
+            eval_returns = returns[:, eval_idx, :].mean(axis=-1)  # mean over episodes per seed
+            mean_return = float(eval_returns.mean())
+            std_return = float(eval_returns.std())
+
+            if use_wandb:
+                wandb.log({
+                    "eval/mean_return": mean_return,
+                    "eval/std_return": std_return,
+                    "eval/min_return": float(eval_returns.min()),
+                    "eval/max_return": float(eval_returns.max()),
+                    "step": eval_step,
+                })
+
         final_returns = returns[:, -1, :].mean(axis=-1)
     else:
         final_returns = returns.mean(axis=-1)
 
     steps_per_sec = steps * num_seeds / runtime
+    steps_per_sec_per_seed = steps_per_sec / num_seeds
 
     print(f"done")
     print(f"\nResults:")
-    print(f"  Steps/sec: {steps_per_sec:,.0f} ({steps_per_sec/num_seeds:,.0f} per seed)")
+    print(f"  Steps/sec: {steps_per_sec:,.0f} ({steps_per_sec_per_seed:,.0f} per seed)")
     print(f"  Final returns: {final_returns.mean():.1f} +/- {final_returns.std():.1f}")
     print(f"  Per-seed: {[f'{r:.1f}' for r in final_returns]}")
+
+    # Log final results to wandb
+    if use_wandb:
+        wandb.log({
+            "final/mean_return": float(final_returns.mean()),
+            "final/std_return": float(final_returns.std()),
+            "final/per_seed_returns": final_returns.tolist(),
+            "perf/steps_per_sec": steps_per_sec,
+            "perf/steps_per_sec_per_seed": steps_per_sec_per_seed,
+            "perf/compile_time": compile_time,
+            "perf/runtime": runtime,
+        })
+        wandb.finish()
 
     return {
         "task": task_name,
         "backend": backend,
         "steps": steps,
         "num_seeds": num_seeds,
+        "compile_time": compile_time,
         "runtime": runtime,
         "steps_per_sec": steps_per_sec,
+        "steps_per_sec_per_seed": steps_per_sec_per_seed,
         "final_returns": final_returns.tolist(),
         "mean_return": float(final_returns.mean()),
         "std_return": float(final_returns.std()),
@@ -878,6 +944,9 @@ def main():
                 args.num_seeds,
                 args.num_envs,
                 config,
+                config_name=config_name,
+                use_wandb=args.use_wandb,
+                wandb_project=args.wandb_project,
             )
             output_dir = Path(args.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
