@@ -1,0 +1,3 @@
+[submodule "vendor/octax"]
+	path = vendor/octax
+	url = https://github.com/riiswa/octax.git
