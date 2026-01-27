@@ -169,17 +169,17 @@ def create_brax_ppo_config(
     env_params,
     total_timesteps: int,
     num_envs: int = 2048,
-    num_steps: int = 10,
+    num_steps: int = 20,  # Brax default unroll_length
     num_epochs: int = 4,
     num_minibatches: int = 64,  # Higher for more gradient steps (like MinAtar)
-    learning_rate: float = 1e-4,
+    learning_rate: float = 3e-4,  # Brax default
     gamma: float = 0.95,
-    ent_coef: float = 1e-4,
+    ent_coef: float = 0.001,  # Brax default entropy_cost
     clip_eps: float = 0.3,
     hidden_layer_sizes: Tuple[int, ...] = (256, 256),
     activation: str = "swish",
     normalize_observations: bool = True,
-    normalize_rewards: bool = True,
+    normalize_rewards: bool = False,  # Brax uses reward_scaling instead
     eval_freq: int = 100_000,
     # AdaMo options
     ortho_mode: Optional[str] = None,
@@ -191,11 +191,12 @@ def create_brax_ppo_config(
 ) -> Dict:
     """Create PPO config for Brax environments.
 
-    Uses settings close to Brax defaults:
+    Uses Brax paper defaults:
     - gamma=0.95 (shorter horizon than typical 0.99)
-    - lr=1e-4 (lower than typical 3e-4)
-    - ent_coef=1e-4 (small entropy bonus)
+    - lr=3e-4 (Brax default)
+    - ent_coef=0.001 (Brax default entropy_cost)
     - clip_eps=0.3 (larger than typical 0.2)
+    - num_steps=20 (unroll_length)
     """
     config = {
         "env": env,
