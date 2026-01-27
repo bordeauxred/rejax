@@ -78,17 +78,20 @@ class UnifiedBraxEnv:
     This wrapper:
     - Pads observations with zeros to unified_obs_size
     - Pads actions (extra dims ignored) to unified_action_size
+    - Scales rewards by reward_scaling (Brax default: 10)
     - Preserves the underlying Brax environment behavior
     """
 
     def __init__(self, env: Brax2GymnaxEnv, task_name: str,
-                 unified_obs_size: int, unified_action_size: int):
+                 unified_obs_size: int, unified_action_size: int,
+                 reward_scaling: float = 10.0):
         self._env = env
         self.task_name = task_name
         self.original_obs_size = env.env.observation_size
         self.original_action_size = env.env.action_size
         self.unified_obs_size = unified_obs_size
         self.unified_action_size = unified_action_size
+        self.reward_scaling = reward_scaling
 
     def __getattr__(self, name):
         if name in ["_env", "task_name", "original_obs_size", "original_action_size",
@@ -119,6 +122,7 @@ class UnifiedBraxEnv:
         action = action[:self.original_action_size]
         obs, state, reward, done, info = self._env.step(key, state, action, params)
         obs = self._pad_obs(obs)
+        reward = reward * self.reward_scaling
         return obs, state, reward, done, info
 
     def _pad_obs(self, obs):
@@ -135,6 +139,7 @@ def create_unified_brax_env(
     unified_obs_size: Optional[int] = None,
     unified_action_size: Optional[int] = None,
     task_list: Optional[List[str]] = None,
+    reward_scaling: float = 10.0,
 ) -> Tuple[UnifiedBraxEnv, Any]:
     """Create a unified Brax environment for continual learning.
 
@@ -144,6 +149,7 @@ def create_unified_brax_env(
         unified_obs_size: Unified observation size (if None, computed from task_list)
         unified_action_size: Unified action size (if None, computed from task_list)
         task_list: List of tasks to compute unified sizes from (default: TASK_ORDER)
+        reward_scaling: Multiply rewards by this factor (Brax default: 10)
 
     Returns:
         Tuple of (UnifiedBraxEnv, env_params)
@@ -156,7 +162,7 @@ def create_unified_brax_env(
         unified_action_size = unified_action_size or computed_act
 
     env, env_params = create_brax(task_name, backend=backend)
-    unified_env = UnifiedBraxEnv(env, task_name, unified_obs_size, unified_action_size)
+    unified_env = UnifiedBraxEnv(env, task_name, unified_obs_size, unified_action_size, reward_scaling)
     return unified_env, env_params
 
 
@@ -843,10 +849,10 @@ def run_single_task(
 
             if use_wandb:
                 wandb.log({
-                    "eval/mean_return": mean_return,
-                    "eval/std_return": std_return,
-                    "eval/min_return": float(eval_returns.min()),
-                    "eval/max_return": float(eval_returns.max()),
+                    f"train/{task_name}/return": mean_return,
+                    f"train/{task_name}/return_std": std_return,
+                    f"train/{task_name}/return_min": float(eval_returns.min()),
+                    f"train/{task_name}/return_max": float(eval_returns.max()),
                     "step": eval_step,
                 })
 
