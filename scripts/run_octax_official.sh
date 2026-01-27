@@ -12,7 +12,7 @@ if [ ! -d "octax" ]; then
 fi
 
 cd octax
-pip install -e . --quiet
+pip install . --quiet
 
 echo "=============================================="
 echo "Running OFFICIAL Octax PPO (ground truth)"
