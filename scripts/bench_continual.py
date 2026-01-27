@@ -1624,11 +1624,12 @@ def run_experiment(
         print(f"Seed {seed_idx + 1}/{num_seeds}")
         print(f"{'='*60}")
 
-        rng = jax.random.PRNGKey(seed + seed_idx)
+        actual_seed = seed + seed_idx
+        rng = jax.random.PRNGKey(actual_seed)
 
         if use_wandb:
             import wandb
-            run_name = f"{config_name}_seed{seed_idx}"
+            run_name = f"{config_name}_seed{actual_seed}"
             wandb.init(
                 project=wandb_project,
                 name=run_name,
@@ -1636,13 +1637,13 @@ def run_experiment(
                     "experiment_config": experiment_config,
                     "steps_per_game": steps_per_game,
                     "num_cycles": num_cycles,
-                    "seed": seed + seed_idx,
+                    "seed": actual_seed,
                 },
                 reinit=True,
             )
 
         trainer = ContinualTrainer(
-            config_name=f"{config_name}_seed{seed_idx}",
+            config_name=f"{config_name}_seed{actual_seed}",
             experiment_config=experiment_config,
             steps_per_game=steps_per_game,
             num_cycles=num_cycles,
@@ -1787,14 +1788,15 @@ def main():
             for experiment_config in configs_to_run:
                 config_name = experiment_config["name"]
                 print(f"\n{'#'*60}", flush=True)
-                print(f"# Config: {config_name} | Seed: {seed_idx}", flush=True)
+                actual_seed = args.seed + seed_idx
+                print(f"# Config: {config_name} | Seed: {actual_seed}", flush=True)
                 print(f"{'#'*60}", flush=True)
 
-                rng = jax.random.PRNGKey(args.seed + seed_idx)
+                rng = jax.random.PRNGKey(actual_seed)
 
                 if args.use_wandb:
                     import wandb
-                    run_name = f"{config_name}_seed{seed_idx}"
+                    run_name = f"{config_name}_seed{actual_seed}"
                     wandb.init(
                         project=args.wandb_project,
                         name=run_name,
@@ -1802,7 +1804,7 @@ def main():
                             "experiment_config": experiment_config,
                             "steps_per_game": args.steps_per_game,
                             "num_cycles": args.num_cycles,
-                            "seed": args.seed + seed_idx,
+                            "seed": actual_seed,
                             "permute_channels": args.permute_channels,
                             "random_game_order": args.random_game_order,
                             "exclude_games": args.exclude_games,
@@ -1811,7 +1813,7 @@ def main():
                     )
 
                 trainer = ContinualTrainer(
-                    config_name=f"{config_name}_seed{seed_idx}",
+                    config_name=f"{config_name}_seed{actual_seed}",
                     experiment_config=experiment_config,
                     steps_per_game=args.steps_per_game,
                     num_cycles=args.num_cycles,
@@ -1822,7 +1824,7 @@ def main():
                     wandb_project=args.wandb_project,
                     permute_channels=args.permute_channels,
                     random_game_order=args.random_game_order,
-                    seed=args.seed + seed_idx,
+                    seed=actual_seed,
                     exclude_games=args.exclude_games,
                 )
 
