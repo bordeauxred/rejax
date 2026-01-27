@@ -361,13 +361,14 @@ def run_single_task(
     game_name: str,
     steps: int,
     num_seeds: int = 3,
-    num_envs: int = 2048,
-    config_name: str = "256x4",
+    num_envs: int = 512,
+    config_name: str = "paper_256x1",
     normalize_rewards: bool = False,
     use_wandb: bool = False,
     wandb_project: str = "rejax-octax-single",
     output_dir: Path = None,
     seed: int = 0,
+    sequential_seeds: bool = False,
 ):
     """Run PPO on a single Octax game with multiple seeds."""
     experiment_config = EXPERIMENT_CONFIGS[config_name]
@@ -411,32 +412,69 @@ def run_single_task(
             reinit=True,
         )
 
-    # Compile with vmapped training
-    print("Compiling...", end=" ", flush=True)
-    compile_start = time.time()
-    keys = jax.random.split(jax.random.PRNGKey(seed), num_seeds)
-    vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
-    train_states, _ = vmap_train(ppo, keys)
-    jax.block_until_ready(train_states)
-    compile_time = time.time() - compile_start
-    print(f"{compile_time:.1f}s")
+    if sequential_seeds:
+        # Run seeds one at a time (lower memory)
+        print(f"Running {num_seeds} seeds sequentially (low memory mode)...")
+        all_returns = []
+        compile_time = 0
+        runtime = 0
 
-    # Benchmark
-    print("Running...", end=" ", flush=True)
-    start = time.time()
-    train_states, eval_data = vmap_train(ppo, keys)
-    jax.block_until_ready(train_states)
-    runtime = time.time() - start
+        for seed_idx in range(num_seeds):
+            key = jax.random.PRNGKey(seed + seed_idx)
 
-    _, returns = eval_data
-    # returns: (num_seeds, num_evals, num_episodes) or (num_seeds, num_episodes)
-    if returns.ndim == 3:
-        final_returns = returns[:, -1, :].mean(axis=-1)
+            if seed_idx == 0:
+                print("  Compiling...", end=" ", flush=True)
+                compile_start = time.time()
+                ts, eval_data = PPO.train(ppo, key)
+                jax.block_until_ready(ts)
+                compile_time = time.time() - compile_start
+                print(f"{compile_time:.1f}s")
+
+            print(f"  Seed {seed_idx + 1}/{num_seeds}...", end=" ", flush=True)
+            start = time.time()
+            ts, eval_data = PPO.train(ppo, key)
+            jax.block_until_ready(ts)
+            seed_runtime = time.time() - start
+            runtime += seed_runtime
+
+            _, returns = eval_data
+            if returns.ndim == 2:
+                seed_return = float(returns[-1, :].mean())
+            else:
+                seed_return = float(returns.mean())
+            all_returns.append(seed_return)
+            print(f"return={seed_return:.1f} ({seed_runtime:.1f}s)")
+
+        final_returns = np.array(all_returns)
+        steps_per_sec = steps * num_seeds / runtime
+        steps_per_sec_per_seed = steps / (runtime / num_seeds)
     else:
-        final_returns = returns.mean(axis=-1)
+        # Vmapped training (fast but more memory)
+        print("Compiling (vmap)...", end=" ", flush=True)
+        compile_start = time.time()
+        keys = jax.random.split(jax.random.PRNGKey(seed), num_seeds)
+        vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
+        train_states, _ = vmap_train(ppo, keys)
+        jax.block_until_ready(train_states)
+        compile_time = time.time() - compile_start
+        print(f"{compile_time:.1f}s")
 
-    steps_per_sec = steps * num_seeds / runtime
-    steps_per_sec_per_seed = steps_per_sec / num_seeds
+        # Benchmark
+        print("Running...", end=" ", flush=True)
+        start = time.time()
+        train_states, eval_data = vmap_train(ppo, keys)
+        jax.block_until_ready(train_states)
+        runtime = time.time() - start
+
+        _, returns = eval_data
+        # returns: (num_seeds, num_evals, num_episodes) or (num_seeds, num_episodes)
+        if returns.ndim == 3:
+            final_returns = returns[:, -1, :].mean(axis=-1)
+        else:
+            final_returns = returns.mean(axis=-1)
+
+        steps_per_sec = steps * num_seeds / runtime
+        steps_per_sec_per_seed = steps_per_sec / num_seeds
 
     print(f"done")
     print(f"\nResults:")
@@ -509,6 +547,8 @@ def main():
                         help="Directory for results")
     parser.add_argument("--seed", type=int, default=0,
                         help="Base random seed")
+    parser.add_argument("--sequential-seeds", action="store_true",
+                        help="Run seeds sequentially (lower memory)")
 
     args = parser.parse_args()
     output_dir = Path(args.output_dir)
@@ -528,6 +568,7 @@ def main():
             wandb_project=args.wandb_project,
             output_dir=output_dir,
             seed=args.seed,
+            sequential_seeds=args.sequential_seeds,
         )
 
     elif args.mode == "full":
