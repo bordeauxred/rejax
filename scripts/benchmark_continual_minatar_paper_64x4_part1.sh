@@ -7,7 +7,7 @@
 # Steps/game:   15M (sufficient for convergence)
 # Cycles:       20 (long-term degradation)
 # Methods:      MLP baseline small vs MLP AdaMO small
-# Seeds:        8 (seeds 26-33, sequential for learning curves)
+# Seeds:        4 (PART 1: seeds 26-29, sequential for learning curves)
 # Games:        4 (Breakout, Asterix, SpaceInvaders, Freeway)
 # Permutation:  YES - channels + game order
 #
@@ -19,8 +19,8 @@
 #
 # OUTPUT: Full learning curves with intermediate evals (for Lyle-style plots)
 #
-# RUNTIME: 15M × 4 games × 20 cycles × 2 methods × 8 seeds = 19.2B steps
-#          → ~64h on H100 (sequential seeds for learning curve data)
+# RUNTIME: 15M × 4 games × 20 cycles × 2 methods × 4 seeds = 9.6B steps
+#          → ~32h on H100 (run part2 on another GPU for full 8 seeds)
 #
 # Usage:
 #   ./scripts/benchmark_continual_minatar_paper_64x4.sh                                # Full 8 seeds
@@ -30,10 +30,10 @@ set -e
 
 STEPS_PER_GAME=${1:-15000000}
 NUM_CYCLES=${2:-20}
-NUM_SEEDS=${3:-8}
+NUM_SEEDS=${3:-4}
 NUM_ENVS=${4:-2048}
 EVAL_FREQ=${5:-500000}
-BASE_SEED=${6:-26}  # Seeds 26-33 give balanced first-game distribution (2 each)
+BASE_SEED=${6:-26}  # Seeds 26-29 (part 1 of balanced 26-33 split)
 
 # Fixed experiment name for reproducibility
 EXPERIMENT_NAME="paper_continual_64x4_permuted"
@@ -42,7 +42,7 @@ CHECKPOINT_DIR="checkpoints/${EXPERIMENT_NAME}"
 WANDB_PROJECT="adamo_continual_paper"
 
 echo "=============================================================="
-echo "PAPER EXPERIMENT: 64x4 + PERMUTATIONS + 20 CYCLES"
+echo "PAPER EXPERIMENT: 64x4 + PERMUTATIONS + 20 CYCLES (PART 1/2)"
 echo "=============================================================="
 echo "Steps per game: $STEPS_PER_GAME"
 echo "Cycles: $NUM_CYCLES"
