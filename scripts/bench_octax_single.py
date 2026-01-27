@@ -225,7 +225,7 @@ EXPERIMENT_CONFIGS = {
     "paper_256x1": {
         "mlp_hidden_sizes": (256,),  # Paper uses SINGLE layer!
         "activation": "relu",
-        "num_epochs": 8,  # Paper default
+        "num_epochs": 4,  # Paper config.yaml uses 4, not 8!
     },
     # ==========================================================================
     # Deep MLPs for AdaMO plasticity research (4 layers)
