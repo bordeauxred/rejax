@@ -373,8 +373,8 @@ def create_cached_eval_fn(ppo):
                 obs, env_state, rng, done, ret, length = carry
                 rng, rng_act, rng_step = jax.random.split(rng, 3)
 
-                # Normalize observation if needed
-                if normalize_obs:
+                # Normalize observation if needed (and obs_rms_state is provided)
+                if normalize_obs and obs_rms_state is not None:
                     obs_normalized = ppo.normalize_obs(obs_rms_state, obs)
                 else:
                     obs_normalized = obs
@@ -612,14 +612,23 @@ class BraxContinualTrainer:
         }
 
     def evaluate_all_tasks(self, train_state, rng, cycle_idx: int, current_task_idx: int):
-        """Evaluate current policy on all tasks."""
+        """Evaluate current policy on all tasks.
+
+        Note: obs_rms_state is only valid for the current task (statistics are task-specific).
+        For other tasks, we evaluate without observation normalization.
+        """
         print(f"  Evaluating on all tasks...")
         eval_results = {}
+        current_task = self.task_list[current_task_idx]
 
         for task_name in self.task_list:
             ppo, _, cached_eval = self._get_ppo_for_task(task_name)
             rng, eval_rng = jax.random.split(rng)
-            obs_rms_state = getattr(train_state, "obs_rms_state", None)
+            # Only use obs_rms_state for current task (stats are task-specific)
+            if task_name == current_task:
+                obs_rms_state = getattr(train_state, "obs_rms_state", None)
+            else:
+                obs_rms_state = None  # Skip normalization for other tasks
             lengths, returns = cached_eval(train_state.actor_ts.params, obs_rms_state, eval_rng)
             mean_return = float(returns.mean())
             eval_results[task_name] = mean_return

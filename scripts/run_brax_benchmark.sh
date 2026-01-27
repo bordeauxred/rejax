@@ -58,8 +58,17 @@ case $MODE in
         ;;
 
     single)
-        echo "=== Single Task Baselines (UTD study) ==="
+        echo "=== Single Task Baselines ==="
         echo "Backend: $BACKEND"
+        echo ""
+        echo "Configs (4 total):"
+        echo "  Brax paper (low UTD):    4×16=64 grad steps"
+        echo "  MinAtar-like (high UTD): 4×128=512 grad steps"
+        echo "  × 2 network sizes: 64x4 and 256x4"
+        echo ""
+        echo "Tasks: hopper, halfcheetah, walker2d, ant (15M each, independently)"
+        echo "Seeds: 3"
+        echo ""
         for task in hopper halfcheetah walker2d ant; do
             echo "--- $task ---"
             uv run python scripts/bench_brax_continual.py \
@@ -68,7 +77,8 @@ case $MODE in
                 --num-seeds 3 \
                 --num-envs 2048 \
                 --backend $BACKEND \
-                --configs baseline_256x4_utd_low baseline_256x4_utd_med baseline_256x4_utd_high
+                --configs baseline_64x4_brax baseline_256x4_brax baseline_64x4_minatar baseline_256x4_minatar \
+                --use-wandb
         done
         ;;
 
@@ -92,9 +102,9 @@ case $MODE in
         echo "Modes:"
         echo "  smoketest  - Quick 500k step test on halfcheetah"
         echo "  compare    - Compare mjx vs spring vs generalized backends"
-        echo "  baseline   - Find best baseline (64x4, 128x4, 256x4) on all tasks"
-        echo "  single     - Single task baselines (15M steps)"
-        echo "  continual  - Full continual learning experiment"
+        echo "  single     - Single task baselines (4 configs × 4 tasks, 15M steps each)"
+        echo "  baseline   - Continual baseline (4 tasks in sequence, 1 cycle)"
+        echo "  continual  - Full continual learning with AdaMo (2 cycles)"
         echo ""
         echo "Backends: spring (fast), mjx (accurate), generalized (deprecated)"
         exit 1
