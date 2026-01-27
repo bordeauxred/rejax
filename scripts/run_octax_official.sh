@@ -1,25 +1,23 @@
 #!/bin/bash
 # Run Octax paper's OFFICIAL PPO to get ground truth returns
-# This tells us what returns we SHOULD expect
+# NOTE: Octax depends on rejax! They use our PPO.
 
 set -e
 
 cd /tmp
 
-# Clone if not exists
-if [ ! -d "octax" ]; then
-    git clone https://github.com/riiswa/octax.git
-fi
-
+rm -rf octax
+git clone https://github.com/riiswa/octax.git
 cd octax
-pip install . --quiet
+
+# Install training deps (rejax, gymnax, hydra)
+pip install hydra-core gymnax
+pip install .
 
 echo "=============================================="
 echo "Running OFFICIAL Octax PPO (ground truth)"
+echo "NOTE: Octax uses rejax PPO internally!"
 echo "=============================================="
-
-# Run 3 games with 2 seeds each to get reliable baselines
-# Paper default: 5M steps, 512 envs, 4 epochs, 32 minibatches
 
 echo ""
 echo "=== BRIX (2 seeds) ==="
@@ -30,10 +28,4 @@ echo "=== TETRIS (2 seeds) ==="
 python train.py env=tetris num_seeds=2 total_timesteps=5000000
 
 echo ""
-echo "=== TANK (2 seeds) ==="
-python train.py env=tank num_seeds=2 total_timesteps=5000000
-
-echo ""
-echo "=============================================="
-echo "DONE - Check results/ folder for learning curves"
-echo "=============================================="
+echo "DONE - Results in /tmp/octax/results/"

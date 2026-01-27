@@ -79,11 +79,16 @@ def run_octax_ppo(game: str, num_seeds: int = 2, total_timesteps: int = 5_000_00
 
     all_returns = []
     for seed_idx in range(num_seeds):
-        # PPOOctaxState structure: agent_ts.params (not just params)
-        params = jax.tree.map(lambda x: x[seed_idx], train_states.agent_ts.params)
+        # make_act expects full train state (ts), not just params
+        # Extract train state for this seed (remove vmap batch dimension)
+        ts_for_seed = jax.tree.map(lambda x: x[seed_idx], train_states)
+        # evaluate signature: (act, rng, env, env_params, num_seeds)
         lengths, returns = evaluate(
-            algo.make_act(params), env, env_params,
-            128, jax.random.PRNGKey(seed_idx)
+            algo.make_act(ts_for_seed),
+            jax.random.PRNGKey(seed_idx + 1000),  # different from training key
+            env,
+            env_params,
+            128  # num_seeds for evaluation
         )
         mean_return = float(returns.mean())
         all_returns.append(mean_return)
