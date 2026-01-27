@@ -28,6 +28,10 @@
 
 set -e
 
+# Prevent JAX from pre-allocating all GPU memory
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# Or use fixed fraction: export XLA_PYTHON_CLIENT_MEM_FRACTION=0.12
+
 STEPS_PER_GAME=${1:-15000000}
 NUM_CYCLES=${2:-20}
 NUM_SEEDS=${3:-4}
