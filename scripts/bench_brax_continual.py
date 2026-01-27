@@ -833,12 +833,12 @@ def main():
     parser.add_argument("--compare-backends", action="store_true",
                         help="Compare throughput across backends")
     parser.add_argument("--single-task", type=str, default=None,
-                        choices=list(BRAX_TASKS.keys()),
+                        choices=TASK_ORDER,
                         help="Run single task baseline (no continual)")
     parser.add_argument("--configs", nargs="+", default=["baseline"],
                         choices=list(EXPERIMENT_CONFIGS.keys()))
     parser.add_argument("--tasks", nargs="+", default=None,
-                        choices=list(BRAX_TASKS.keys()),
+                        choices=TASK_ORDER,
                         help="Tasks to include (default: all)")
 
     args = parser.parse_args()
