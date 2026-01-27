@@ -259,26 +259,29 @@ def benchmark_depth(
     # Prepare seeds
     keys = jax.random.split(jax.random.PRNGKey(42), num_seeds)
 
-    # Vectorized training
+    # Vectorized training across seeds
+    # Note: vmap parallelizes the 3 seeds on GPU - they train simultaneously
+    # Each depth/method config runs sequentially (12 configs total)
     vmap_train = jax.jit(jax.vmap(PPO.train, in_axes=(None, 0)))
 
     # Compile
-    print(f"  Compiling...")
+    print(f"  Compiling (vmap over {num_seeds} seeds)...")
     start = time.time()
     _ = vmap_train(ppo, keys)
     jax.block_until_ready(_)
     compile_time = time.time() - start
     print(f"  Compiled in {compile_time:.1f}s")
 
-    # Train
-    print(f"  Training {num_seeds} seeds...")
+    # Train with progress printing
+    print(f"  Training {num_seeds} seeds in parallel (vmap)...")
     start = time.time()
     ts, eval_results = vmap_train(ppo, keys)
     jax.block_until_ready(ts)
     runtime = time.time() - start
 
     steps_per_second = (total_timesteps * num_seeds) / runtime
-    print(f"  Completed in {runtime:.1f}s ({steps_per_second:,.0f} steps/s)")
+    print(f"  Completed in {runtime:.1f}s ({steps_per_second:,.0f} steps/s total, "
+          f"{steps_per_second/num_seeds:,.0f} steps/s per seed)")
 
     # Extract learning curves
     lengths, returns = eval_results
@@ -310,10 +313,11 @@ def benchmark_depth(
 
     print(f"  Final return: {result.final_return_mean:.1f} +/- {result.final_return_std:.1f}")
 
-    # Log to wandb
+    # Log to wandb - use wandb.Table for learning curves to avoid step issues
     if use_wandb and wandb_run:
         import wandb
 
+        # Log summary metrics (single log call)
         wandb.log({
             f"{config_name}/final_return_mean": result.final_return_mean,
             f"{config_name}/final_return_std": result.final_return_std,
@@ -322,15 +326,19 @@ def benchmark_depth(
             f"{config_name}/depth": depth,
         })
 
-        # Log learning curves
+        # Log learning curves as a table (avoids step counter issues)
         mean_curve = np.mean([c.returns_mean for c in curves], axis=0)
         std_curve = np.std([c.returns_mean for c in curves], axis=0)
-        for i, (step, mean_ret, std_ret) in enumerate(zip(eval_steps, mean_curve, std_curve)):
-            wandb.log({
-                f"{config_name}/return_mean": mean_ret,
-                f"{config_name}/return_std": std_ret,
-                f"{config_name}/step": step,
-            })
+
+        curve_data = []
+        for step, mean_ret, std_ret in zip(eval_steps, mean_curve, std_curve):
+            curve_data.append([config_name, depth, method, int(step), float(mean_ret), float(std_ret)])
+
+        curve_table = wandb.Table(
+            columns=["config", "depth", "method", "step", "return_mean", "return_std"],
+            data=curve_data
+        )
+        wandb.log({f"{config_name}/learning_curve": curve_table})
 
     return result
 
@@ -381,8 +389,14 @@ def run_depth_study(
             },
         )
 
+    total_configs = len(depths) * len(methods)
+    config_idx = 0
+
     for depth in depths:
         for method in methods:
+            config_idx += 1
+            print(f"\n>>> Config {config_idx}/{total_configs}: depth={depth}, method={method}")
+
             depth_result = benchmark_depth(
                 depth=depth,
                 method=method,
