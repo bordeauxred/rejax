@@ -763,9 +763,13 @@ def run_single_task(
     print(f"Config: {config}")
     print("=" * 60)
 
-    # For single-task, use native env (no padding needed)
-    env, env_params = create_brax(task_name, backend=backend)
-    print(f"Env: obs={env.env.observation_size}, action={env.env.action_size}")
+    # Use unified env for fair comparison with continual learning
+    unified_obs, unified_act = get_unified_sizes(TASK_ORDER, backend)
+    env, env_params = create_unified_brax_env(
+        task_name, backend=backend,
+        unified_obs_size=unified_obs, unified_action_size=unified_act
+    )
+    print(f"Env: obs={env.original_obs_size}→{unified_obs}, action={env.original_action_size}→{unified_act}")
     ppo_config = create_brax_ppo_config(
         env=env,
         env_params=env_params,
