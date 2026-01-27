@@ -36,10 +36,16 @@ case $MODE in
         ;;
 
     baseline)
-        echo "=== Finding Best Baseline (3 configs × 4 tasks × 3 seeds) ==="
+        echo "=== Brax PPO Baseline Study ==="
         echo "Backend: $BACKEND"
-        echo "Configs: baseline_64x4, baseline_128x4, baseline_256x4"
-        echo "Steps per task: 15M"
+        echo ""
+        echo "Configs (4 total):"
+        echo "  Brax paper (low UTD):   4×16=64 grad steps,  UTD≈0.003"
+        echo "  MinAtar-like (high UTD): 4×128=512 grad steps, UTD≈0.025"
+        echo "  × 2 network sizes: 64x4 and 256x4"
+        echo ""
+        echo "Tasks: hopper → halfcheetah → walker2d → ant (15M each)"
+        echo "Seeds: 3"
         echo ""
         uv run python scripts/bench_brax_continual.py \
             --steps-per-task 15000000 \
@@ -47,11 +53,12 @@ case $MODE in
             --num-seeds 3 \
             --num-envs 2048 \
             --backend $BACKEND \
-            --configs baseline_64x4 baseline_128x4 baseline_256x4
+            --configs baseline_64x4_brax baseline_256x4_brax baseline_64x4_minatar baseline_256x4_minatar \
+            --use-wandb
         ;;
 
     single)
-        echo "=== Single Task Baselines ==="
+        echo "=== Single Task Baselines (UTD study) ==="
         echo "Backend: $BACKEND"
         for task in hopper halfcheetah walker2d ant; do
             echo "--- $task ---"
@@ -61,7 +68,7 @@ case $MODE in
                 --num-seeds 3 \
                 --num-envs 2048 \
                 --backend $BACKEND \
-                --configs baseline_256x4 baseline_64x4
+                --configs baseline_256x4_utd_low baseline_256x4_utd_med baseline_256x4_utd_high
         done
         ;;
 

@@ -38,20 +38,33 @@ from brax.envs import create as brax_create
 # Brax Task Configurations
 # =============================================================================
 
-# Tasks ordered roughly by complexity (observation/action size)
-BRAX_TASKS = {
-    "hopper": {"obs_size": 11, "action_size": 3},
-    "halfcheetah": {"obs_size": 17, "action_size": 6},
-    "walker2d": {"obs_size": 17, "action_size": 6},
-    "ant": {"obs_size": 27, "action_size": 8},
-}
+def get_brax_task_info(task_name: str, backend: str = "spring") -> Dict[str, int]:
+    """Get observation and action sizes for a Brax task (dynamically)."""
+    from brax.envs import create
+    env = create(task_name, backend=backend)
+    return {
+        "obs_size": env.observation_size,
+        "action_size": env.action_size,
+        "episode_length": env.episode_length,
+    }
 
-# Default task order for continual learning
+
+def get_unified_sizes(task_list: List[str], backend: str = "spring") -> Tuple[int, int]:
+    """Compute unified obs/action sizes as max across all tasks."""
+    max_obs = 0
+    max_act = 0
+    for task in task_list:
+        info = get_brax_task_info(task, backend)
+        max_obs = max(max_obs, info["obs_size"])
+        max_act = max(max_act, info["action_size"])
+    return max_obs, max_act
+
+
+# Default task order for continual learning (ordered by complexity)
 TASK_ORDER = ["hopper", "halfcheetah", "walker2d", "ant"]
 
-# Unified space sizes (max across all tasks)
-UNIFIED_OBS_SIZE = 27  # max from ant
-UNIFIED_ACTION_SIZE = 8  # max from ant
+# Cache for task info to avoid repeated env creation
+_TASK_INFO_CACHE = {}
 
 
 # =============================================================================
@@ -63,19 +76,23 @@ class UnifiedBraxEnv:
 
     For continual learning, all tasks must have the same input/output dimensions.
     This wrapper:
-    - Pads observations with zeros to UNIFIED_OBS_SIZE
-    - Pads actions (extra dims ignored) to UNIFIED_ACTION_SIZE
+    - Pads observations with zeros to unified_obs_size
+    - Pads actions (extra dims ignored) to unified_action_size
     - Preserves the underlying Brax environment behavior
     """
 
-    def __init__(self, env: Brax2GymnaxEnv, task_name: str):
+    def __init__(self, env: Brax2GymnaxEnv, task_name: str,
+                 unified_obs_size: int, unified_action_size: int):
         self._env = env
         self.task_name = task_name
-        self.original_obs_size = BRAX_TASKS[task_name]["obs_size"]
-        self.original_action_size = BRAX_TASKS[task_name]["action_size"]
+        self.original_obs_size = env.env.observation_size
+        self.original_action_size = env.env.action_size
+        self.unified_obs_size = unified_obs_size
+        self.unified_action_size = unified_action_size
 
     def __getattr__(self, name):
         if name in ["_env", "task_name", "original_obs_size", "original_action_size",
+                    "unified_obs_size", "unified_action_size",
                     "reset", "step", "observation_space", "action_space"]:
             return super().__getattribute__(name)
         return getattr(self._env, name)
@@ -86,11 +103,11 @@ class UnifiedBraxEnv:
 
     def observation_space(self, params):
         from gymnax.environments import spaces
-        return spaces.Box(low=-jnp.inf, high=jnp.inf, shape=(UNIFIED_OBS_SIZE,))
+        return spaces.Box(low=-jnp.inf, high=jnp.inf, shape=(self.unified_obs_size,))
 
     def action_space(self, params):
         from gymnax.environments import spaces
-        return spaces.Box(low=-1.0, high=1.0, shape=(UNIFIED_ACTION_SIZE,))
+        return spaces.Box(low=-1.0, high=1.0, shape=(self.unified_action_size,))
 
     def reset(self, key, params):
         obs, state = self._env.reset(key, params)
@@ -106,24 +123,40 @@ class UnifiedBraxEnv:
 
     def _pad_obs(self, obs):
         """Pad observation to unified size."""
-        if self.original_obs_size < UNIFIED_OBS_SIZE:
-            pad_width = UNIFIED_OBS_SIZE - self.original_obs_size
+        if self.original_obs_size < self.unified_obs_size:
+            pad_width = self.unified_obs_size - self.original_obs_size
             obs = jnp.pad(obs, (0, pad_width))
         return obs
 
 
-def create_unified_brax_env(task_name: str, backend: str = "mjx") -> Tuple[UnifiedBraxEnv, Any]:
+def create_unified_brax_env(
+    task_name: str,
+    backend: str = "spring",
+    unified_obs_size: Optional[int] = None,
+    unified_action_size: Optional[int] = None,
+    task_list: Optional[List[str]] = None,
+) -> Tuple[UnifiedBraxEnv, Any]:
     """Create a unified Brax environment for continual learning.
 
     Args:
         task_name: Name of the Brax task (hopper, halfcheetah, walker2d, ant)
-        backend: Physics backend ("mjx" recommended, "spring" or "generalized" also available)
+        backend: Physics backend ("spring" fast, "mjx" accurate, "generalized" deprecated)
+        unified_obs_size: Unified observation size (if None, computed from task_list)
+        unified_action_size: Unified action size (if None, computed from task_list)
+        task_list: List of tasks to compute unified sizes from (default: TASK_ORDER)
 
     Returns:
         Tuple of (UnifiedBraxEnv, env_params)
     """
+    # Compute unified sizes if not provided
+    if unified_obs_size is None or unified_action_size is None:
+        tasks = task_list or TASK_ORDER
+        computed_obs, computed_act = get_unified_sizes(tasks, backend)
+        unified_obs_size = unified_obs_size or computed_obs
+        unified_action_size = unified_action_size or computed_act
+
     env, env_params = create_brax(task_name, backend=backend)
-    unified_env = UnifiedBraxEnv(env, task_name)
+    unified_env = UnifiedBraxEnv(env, task_name, unified_obs_size, unified_action_size)
     return unified_env, env_params
 
 
@@ -138,13 +171,15 @@ def create_brax_ppo_config(
     num_envs: int = 2048,
     num_steps: int = 10,
     num_epochs: int = 4,
-    num_minibatches: int = 32,
-    learning_rate: float = 3e-4,
+    num_minibatches: int = 64,  # Higher for more gradient steps (like MinAtar)
+    learning_rate: float = 1e-4,
+    gamma: float = 0.95,
+    ent_coef: float = 1e-4,
+    clip_eps: float = 0.3,
     hidden_layer_sizes: Tuple[int, ...] = (256, 256),
     activation: str = "swish",
     normalize_observations: bool = True,
     normalize_rewards: bool = True,
-    reward_scaling: float = 1.0,
     eval_freq: int = 100_000,
     # AdaMo options
     ortho_mode: Optional[str] = None,
@@ -156,7 +191,11 @@ def create_brax_ppo_config(
 ) -> Dict:
     """Create PPO config for Brax environments.
 
-    Uses settings similar to PureJaxRL/Brax defaults.
+    Uses settings close to Brax defaults:
+    - gamma=0.95 (shorter horizon than typical 0.99)
+    - lr=1e-4 (lower than typical 3e-4)
+    - ent_coef=1e-4 (small entropy bonus)
+    - clip_eps=0.3 (larger than typical 0.2)
     """
     config = {
         "env": env,
@@ -172,10 +211,10 @@ def create_brax_ppo_config(
         "num_epochs": num_epochs,
         "num_minibatches": num_minibatches,
         "learning_rate": learning_rate,
-        "gamma": 0.99,
+        "gamma": gamma,
         "gae_lambda": 0.95,
-        "clip_eps": 0.2,
-        "ent_coef": 0.0,  # Brax typically uses 0 entropy for continuous control
+        "clip_eps": clip_eps,
+        "ent_coef": ent_coef,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
         "total_timesteps": total_timesteps,
@@ -210,9 +249,89 @@ def create_brax_ppo_config(
 # Experiment Configurations
 # =============================================================================
 
+# Experiment configs for Brax PPO
+# Note: All use Brax-tuned hyperparams (gamma=0.95, lr=1e-4, etc.)
+#
+# UTD (Update-To-Data) ratio = grad_steps / env_steps
+# With num_envs=2048, num_steps=10: B = 20,480 steps per iteration
+# UTD = (num_epochs × num_minibatches) / B
+#
 EXPERIMENT_CONFIGS = {
+    # ==========================================================================
+    # Brax paper settings (low UTD): 4×16=64 grad steps, UTD≈0.003
+    # ==========================================================================
+    "baseline_64x4_brax": {
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "activation": "swish",
+        "ortho_mode": None,
+        "num_epochs": 4,
+        "num_minibatches": 16,
+    },
+    "baseline_256x4_brax": {
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "activation": "swish",
+        "ortho_mode": None,
+        "num_epochs": 4,
+        "num_minibatches": 16,
+    },
+    # ==========================================================================
+    # MinAtar-like settings (high UTD): 4×128=512 grad steps, UTD≈0.025
+    # ==========================================================================
+    "baseline_64x4_minatar": {
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "activation": "swish",
+        "ortho_mode": None,
+        "num_epochs": 4,
+        "num_minibatches": 128,
+    },
+    "baseline_256x4_minatar": {
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "activation": "swish",
+        "ortho_mode": None,
+        "num_epochs": 4,
+        "num_minibatches": 128,
+    },
+    # ==========================================================================
+    # AdaMo variants
+    # ==========================================================================
+    "adamo_256x4": {
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "activation": "groupsort",
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+    },
+    "adamo_64x4": {
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "activation": "groupsort",
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+    },
+    "adamo_scale_256x4": {
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "activation": "groupsort",
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "scale_enabled": True,
+        "scale_reg_coeff": 0.01,
+    },
+    # ==========================================================================
+    # Other plasticity methods
+    # ==========================================================================
+    "l2_init_256x4": {
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "activation": "swish",
+        "l2_init_coeff": 0.001,
+    },
+    "nap_256x4": {
+        "hidden_layer_sizes": (256, 256, 256, 256),
+        "activation": "swish",
+        "nap_enabled": True,
+    },
+    # ==========================================================================
+    # Legacy aliases (for backward compatibility)
+    # ==========================================================================
     "baseline": {
-        "hidden_layer_sizes": (256, 256),
+        "hidden_layer_sizes": (256, 256, 256, 256),
         "activation": "swish",
         "ortho_mode": None,
     },
@@ -226,24 +345,6 @@ EXPERIMENT_CONFIGS = {
         "activation": "groupsort",
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
-    },
-    "adamo_scale": {
-        "hidden_layer_sizes": (256, 256, 256, 256),
-        "activation": "groupsort",
-        "ortho_mode": "optimizer",
-        "ortho_coeff": 0.1,
-        "scale_enabled": True,
-        "scale_reg_coeff": 0.01,
-    },
-    "l2_init": {
-        "hidden_layer_sizes": (256, 256, 256, 256),
-        "activation": "swish",
-        "l2_init_coeff": 0.001,
-    },
-    "nap": {
-        "hidden_layer_sizes": (256, 256, 256, 256),
-        "activation": "swish",
-        "nap_enabled": True,
     },
 }
 
@@ -312,7 +413,7 @@ class BraxContinualTrainer:
         experiment_config: Dict,
         steps_per_task: int,
         num_cycles: int,
-        backend: str = "mjx",
+        backend: str = "spring",
         num_envs: int = 2048,
         eval_freq: int = 100_000,
         use_wandb: bool = False,
@@ -332,6 +433,12 @@ class BraxContinualTrainer:
         self.seed = seed
         self.task_list = task_list or TASK_ORDER
 
+        # Compute unified sizes once for all tasks
+        self.unified_obs_size, self.unified_action_size = get_unified_sizes(
+            self.task_list, backend
+        )
+        print(f"Unified sizes: obs={self.unified_obs_size}, action={self.unified_action_size}")
+
         self.results = {
             "config_name": config_name,
             "experiment_config": experiment_config,
@@ -344,6 +451,29 @@ class BraxContinualTrainer:
 
         # Cache PPO instances and compiled functions per task
         self._ppo_cache = {}
+
+    def _print_grad_step_diagnostics(self):
+        """Print gradient step diagnostics to verify we have enough updates."""
+        # Get PPO config values (use defaults from create_brax_ppo_config)
+        num_envs = self.num_envs
+        num_steps = self.experiment_config.get("num_steps", 10)
+        num_epochs = self.experiment_config.get("num_epochs", 4)
+        num_minibatches = self.experiment_config.get("num_minibatches", 64)
+
+        B = num_envs * num_steps
+        num_updates = self.steps_per_task // B
+        grad_steps_per_update = num_epochs * num_minibatches
+        total_grad_steps = num_updates * grad_steps_per_update
+
+        print(f"\nGradient step diagnostics:")
+        print(f"  B (batch) = {num_envs} × {num_steps} = {B:,}")
+        print(f"  num_updates = {num_updates:,}")
+        print(f"  grad_steps/update = {num_epochs} × {num_minibatches} = {grad_steps_per_update}")
+        print(f"  total_grad_steps = {total_grad_steps:,}")
+        if total_grad_steps < 10_000:
+            print(f"  ⚠️  WARNING: Low gradient steps! May not learn well.")
+        else:
+            print(f"  ✓ Gradient steps OK")
 
     def _get_ppo_for_task(self, task_name: str):
         """Get cached PPO and compiled functions for a task."""
@@ -363,7 +493,12 @@ class BraxContinualTrainer:
 
     def _create_ppo_for_task(self, task_name: str) -> PPO:
         """Create PPO instance for a specific task."""
-        env, env_params = create_unified_brax_env(task_name, backend=self.backend)
+        env, env_params = create_unified_brax_env(
+            task_name,
+            backend=self.backend,
+            unified_obs_size=self.unified_obs_size,
+            unified_action_size=self.unified_action_size,
+        )
 
         config = create_brax_ppo_config(
             env=env,
@@ -502,6 +637,9 @@ class BraxContinualTrainer:
         print(f"Steps per task: {self.steps_per_task:,}")
         print(f"Cycles: {self.num_cycles}")
 
+        # Print gradient step diagnostics
+        self._print_grad_step_diagnostics()
+
         for cycle_idx in range(self.num_cycles):
             print(f"\n{'='*60}")
             print(f"Cycle {cycle_idx + 1}/{self.num_cycles}")
@@ -546,7 +684,9 @@ def compare_backends(task_name: str, steps: int, num_envs: int = 2048):
     for backend in backends:
         print(f"\n{backend.upper()}:")
         try:
-            env, env_params = create_unified_brax_env(task_name, backend=backend)
+            # For single-task comparison, use native env (no padding needed)
+            env, env_params = create_brax(task_name, backend=backend)
+            print(f"  obs={env.env.observation_size}, action={env.env.action_size}")
             config = create_brax_ppo_config(
                 env=env,
                 env_params=env_params,
@@ -601,7 +741,7 @@ def compare_backends(task_name: str, steps: int, num_envs: int = 2048):
 def run_single_task(
     task_name: str,
     steps: int,
-    backend: str = "mjx",
+    backend: str = "spring",
     num_seeds: int = 3,
     num_envs: int = 2048,
     experiment_config: Optional[Dict] = None,
@@ -614,7 +754,9 @@ def run_single_task(
     print(f"Config: {config}")
     print("=" * 60)
 
-    env, env_params = create_unified_brax_env(task_name, backend=backend)
+    # For single-task, use native env (no padding needed)
+    env, env_params = create_brax(task_name, backend=backend)
+    print(f"Env: obs={env.env.observation_size}, action={env.env.action_size}")
     ppo_config = create_brax_ppo_config(
         env=env,
         env_params=env_params,
@@ -680,7 +822,7 @@ def main():
     parser.add_argument("--num-seeds", type=int, default=3)
     parser.add_argument("--num-envs", type=int, default=2048)
     parser.add_argument("--eval-freq", type=int, default=100_000)
-    parser.add_argument("--backend", type=str, default="mjx",
+    parser.add_argument("--backend", type=str, default="spring",
                         choices=["mjx", "spring", "generalized"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--use-wandb", action="store_true")

@@ -60,7 +60,9 @@ def test_native_brax():
             print(f"  Final reward: {final_reward:.1f}")
             print(f"  Elapsed: {elapsed:.1f}s")
         except Exception as e:
+            import traceback
             print(f"  ERROR: {e}")
+            traceback.print_exc()
 
 
 def test_rejax_brax():
@@ -110,7 +112,9 @@ def test_rejax_brax():
             print(f"  Steps/sec: {steps_per_sec:,.0f}")
             print(f"  Final return: {returns.mean():.1f}")
         except Exception as e:
+            import traceback
             print(f"  ERROR: {e}")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
