@@ -59,7 +59,7 @@ def run_octax_ppo(game: str, num_seeds: int = 2, total_timesteps: int = 5_000_00
 
     # Create agent exactly like they do
     agent = PPOOctax.create_agent(cfg, env, env_params)
-    algo = PPOOctax(env=env, env_params=env_params, agent=agent, **cfg)
+    algo = PPOOctax(env=env, env_params=env_params, agent=agent, eval_callback=lambda *args: None, **cfg)
 
     # Train with vmap over seeds
     print("Compiling...")
