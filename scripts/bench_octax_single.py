@@ -271,7 +271,7 @@ EXPERIMENT_CONFIGS = {
 def run_throughput_test(
     games: list = None,
     num_envs_list: list = None,
-    steps: int = 100_000,
+    steps: int = 1_000_000,  # Need enough steps to measure properly
     output_dir: Path = None,
 ):
     """Test throughput across different env counts."""
