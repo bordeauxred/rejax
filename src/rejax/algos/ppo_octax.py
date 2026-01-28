@@ -38,7 +38,9 @@ class OctaxAgent(nn.Module):
     - 3-layer CNN feature extractor (shared between actor and critic)
     - Separate MLP heads for actor and critic
 
-    Input: (batch, 4, 32, 64) CHW format from OctaxGymnaxWrapper
+    Input: (batch, 4, 32, 64) from OctaxGymnaxWrapper
+    Note: Paper interprets this as NHWC (H=4, W=32, C=64) without transpose.
+    This is technically unconventional but matches their exact implementation.
     """
     action_dim: int
     conv_features: Tuple[int, int, int] = (32, 64, 64)
@@ -72,9 +74,12 @@ class OctaxAgent(nn.Module):
         )
 
     def __call__(self, obs, rng, action=None):
-        """Forward pass returning action, log_prob, entropy, value."""
-        # Transpose CHW -> HWC for Flax Conv (NHWC format)
-        obs = obs.transpose((0, 2, 3, 1))
+        """Forward pass returning action, log_prob, entropy, value.
+
+        Note: Paper does NOT transpose. Input (4, 32, 64) is interpreted as
+        NHWC with H=4, W=32, C=64. This is technically "wrong" but works
+        empirically and matches their exact architecture.
+        """
         features = self.features(obs)
 
         value = self.critic(features)
@@ -88,13 +93,11 @@ class OctaxAgent(nn.Module):
 
     def call_critic(self, obs):
         """Get value only (for bootstrapping)."""
-        obs = obs.transpose((0, 2, 3, 1))
         features = self.features(obs)
         return self.critic(features)
 
     def call_actor(self, obs, rng):
         """Get action only (for evaluation)."""
-        obs = obs.transpose((0, 2, 3, 1))
         features = self.features(obs)
         return self.actor(features, rng)
 
