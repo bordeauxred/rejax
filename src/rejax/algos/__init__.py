@@ -10,6 +10,7 @@ from .mixins import (
 )
 from .ppo import PPO
 from .ppo_octax import PPOOctax
+from .ppo_octax_popart import PPOOctaxPopArt
 from .pqn import PQN
 from .sac import SAC
 from .td3 import TD3
@@ -20,6 +21,7 @@ __all__ = [
     "IQN",
     "PPO",
     "PPOOctax",
+    "PPOOctaxPopArt",
     "PQN",
     "SAC",
     "TD3",
