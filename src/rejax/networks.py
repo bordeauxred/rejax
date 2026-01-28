@@ -104,7 +104,7 @@ class OctaxCNN(nn.Module):
     - Flatten -> 1024
     - MLP: configurable depth (default 4x256 for AdaMO research)
 
-    Input shape: (batch, 64, 32, 4) - HWC format after transpose from octax wrapper
+    Input shape: (batch, 4, 32, 64) - CHW format from octax wrapper (transposed internally to NHWC)
     """
     conv_channels: tuple[int, int, int] = (32, 64, 64)
     mlp_hidden_sizes: Sequence[int] = (256, 256, 256, 256)
@@ -116,6 +116,11 @@ class OctaxCNN(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        # Octax outputs CHW format (batch, 4, 32, 64) = (B, C, H, W)
+        # Flax Conv expects NHWC format (batch, H, W, C)
+        # Transpose: (B, C, H, W) -> (B, H, W, C)
+        x = x.transpose((0, 2, 3, 1))
+
         # Conv1: 32 filters, kernel (8,4), stride (4,2)
         if self.use_orthogonal_init:
             x = nn.Conv(self.conv_channels[0], kernel_size=(8, 4), strides=(4, 2),

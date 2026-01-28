@@ -1,4 +1,4 @@
-from rejax.algos import DQN, IQN, PPO, PQN, SAC, TD3, Algorithm
+from rejax.algos import DQN, IQN, PPO, PPOOctax, PQN, SAC, TD3, Algorithm
 from rejax.networks import CNN, DiscreteCNNPolicy, CNNVNetwork
 
 
@@ -6,6 +6,7 @@ _algos = {
     "dqn": DQN,
     "iqn": IQN,
     "ppo": PPO,
+    "ppo_octax": PPOOctax,
     "pqn": PQN,
     "sac": SAC,
     "td3": TD3,
@@ -21,6 +22,7 @@ __all__ = [
     "DQN",
     "IQN",
     "PPO",
+    "PPOOctax",
     "PQN",
     "SAC",
     "TD3",
