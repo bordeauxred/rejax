@@ -23,12 +23,12 @@ from flax.training.train_state import TrainState
 
 from rejax.algos.algorithm import Algorithm, register_init
 from rejax.algos.mixins import (
-    NormalizeObservationsMixin,
     NormalizeRewardsMixin,
     OnPolicyMixin,
 )
 from rejax.algos.ppo import AdvantageMinibatch, Trajectory
-from rejax.networks import DiscretePolicy, VNetwork
+from rejax.networks import DiscretePolicy, VNetwork, parse_activation_fn
+from rejax.regularization import apply_ortho_update, compute_gram_regularization_loss
 
 
 class OctaxAgent(nn.Module):
@@ -102,7 +102,7 @@ class OctaxAgent(nn.Module):
         return self.actor(features, rng)
 
 
-class PPOOctax(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algorithm):
+class PPOOctax(OnPolicyMixin, NormalizeRewardsMixin, Algorithm):
     """PPO with shared CNN backbone - matches octax paper architecture.
 
     Key differences from standard PPO:
@@ -121,12 +121,15 @@ class PPOOctax(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin,
     vf_coef: chex.Scalar = struct.field(pytree_node=True, default=0.5)
     ent_coef: chex.Scalar = struct.field(pytree_node=True, default=0.01)
 
+    # Orthonormalization settings (AdaMo)
+    ortho_mode: Optional[str] = struct.field(pytree_node=False, default=None)  # None, "loss", "optimizer"
+    ortho_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.2)  # loss mode coefficient
+    ortho_coeff: chex.Scalar = struct.field(pytree_node=True, default=1e-3)  # optimizer mode coefficient
+    ortho_exclude_output: bool = struct.field(pytree_node=False, default=True)
+
     def make_act(self, ts):
         """Create action function for evaluation."""
         def act(obs, rng):
-            if self.normalize_observations:
-                obs = self.normalize_obs(ts.obs_rms_state, obs)
-
             obs = jnp.expand_dims(obs, 0)
             action, _, _, _ = self.agent.apply(ts.agent_ts.params, obs, rng)
             return jnp.squeeze(action)
@@ -139,10 +142,10 @@ class PPOOctax(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin,
 
         agent_kwargs = config.pop("agent_kwargs", {})
 
-        # Parse activation
+        # Parse activation (supports groupsort!)
         activation_name = agent_kwargs.pop("activation", "relu")
         if isinstance(activation_name, str):
-            activation = getattr(nn, activation_name)
+            activation = parse_activation_fn(activation_name)
         else:
             activation = activation_name
 
@@ -224,13 +227,7 @@ class PPOOctax(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin,
                 rng_steps, ts.env_state, action, self.env_params
             )
 
-            # Optional normalization
-            if self.normalize_observations:
-                obs_rms_state, next_obs = self.update_and_normalize_obs(
-                    ts.obs_rms_state, next_obs
-                )
-                ts = ts.replace(obs_rms_state=obs_rms_state)
-
+            # Reward normalization (important for continual learning across games)
             if self.normalize_rewards:
                 rew_rms_state, reward = self.update_and_normalize_rew(
                     ts.rew_rms_state, reward, done
@@ -301,7 +298,29 @@ class PPOOctax(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin,
             value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
             value_loss = self.vf_coef * value_loss
 
-            return actor_loss + value_loss
+            total_loss = actor_loss + value_loss
+
+            # Add ortho loss if in loss mode
+            if self.ortho_mode == "loss":
+                ortho_loss, _ = compute_gram_regularization_loss(
+                    params, lambda_coeff=self.ortho_lambda,
+                    exclude_output=self.ortho_exclude_output
+                )
+                total_loss = total_loss + ortho_loss
+
+            return total_loss
 
         grads = jax.grad(loss_fn)(ts.agent_ts.params)
-        return ts.replace(agent_ts=ts.agent_ts.apply_gradients(grads=grads))
+        new_agent_ts = ts.agent_ts.apply_gradients(grads=grads)
+
+        # Apply ortho update if in optimizer mode
+        if self.ortho_mode == "optimizer":
+            new_params = apply_ortho_update(
+                new_agent_ts.params,
+                lr=self.learning_rate,
+                ortho_coeff=self.ortho_coeff,
+                exclude_output=self.ortho_exclude_output,
+            )
+            new_agent_ts = new_agent_ts.replace(params=new_params)
+
+        return ts.replace(agent_ts=new_agent_ts)

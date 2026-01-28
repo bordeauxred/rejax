@@ -28,7 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from rejax import PPO
+from rejax import PPOOctax
 from rejax.evaluate import evaluate
 from rejax.compat.octax2gymnax import create_octax
 from rejax.regularization import compute_gram_regularization_loss, compute_l2_init_loss
@@ -64,31 +64,27 @@ UNIFIED_ACTIONS = 6
 EXPERIMENT_CONFIGS = {
     # Baseline: standard PPO with ReLU
     "baseline": {
-        "mlp_hidden_sizes": (64, 64, 64, 64),
-        "activation": "relu",
+        "agent_kwargs": {"mlp_hidden_sizes": (64, 64, 64, 64), "activation": "relu"},
         "ortho_mode": None,
         "normalize_rewards": False,
     },
     # AdaMo with GroupSort activation (1-Lipschitz)
     "adamo_groupsort": {
-        "mlp_hidden_sizes": (64, 64, 64, 64),
-        "activation": "groupsort",
+        "agent_kwargs": {"mlp_hidden_sizes": (64, 64, 64, 64), "activation": "groupsort"},
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "normalize_rewards": False,
     },
     # AdaMo with ReLU (ablation: ortho without 1-Lipschitz)
     "adamo_relu": {
-        "mlp_hidden_sizes": (64, 64, 64, 64),
-        "activation": "relu",
+        "agent_kwargs": {"mlp_hidden_sizes": (64, 64, 64, 64), "activation": "relu"},
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "normalize_rewards": False,
     },
     # AdaMo + GroupSort + reward normalization (ablation)
     "adamo_groupsort_norm": {
-        "mlp_hidden_sizes": (64, 64, 64, 64),
-        "activation": "groupsort",
+        "agent_kwargs": {"mlp_hidden_sizes": (64, 64, 64, 64), "activation": "groupsort"},
         "ortho_mode": "optimizer",
         "ortho_coeff": 0.1,
         "normalize_rewards": True,
@@ -144,30 +140,32 @@ class UnifiedOctaxEnv:
 
 def create_octax_ppo(
     game: str,
-    mlp_hidden_sizes: Tuple[int, ...] = (64, 64, 64, 64),
-    activation: str = "relu",
+    agent_kwargs: Optional[Dict[str, Any]] = None,
     ortho_mode: Optional[str] = None,
     ortho_coeff: float = 0.1,
     normalize_rewards: bool = False,
     num_envs: int = 512,
     total_timesteps: int = 5_000_000,
     eval_freq: int = 250_000,
-) -> PPO:
-    """Create PPO configured for Octax with OctaxCNN networks."""
+) -> PPOOctax:
+    """Create PPOOctax configured for Octax with shared backbone."""
     env, env_params = create_octax(game)
     env = UnifiedOctaxEnv(env, game)
+
+    # Default agent kwargs
+    if agent_kwargs is None:
+        agent_kwargs = {"mlp_hidden_sizes": (64, 64, 64, 64), "activation": "relu"}
+
+    # Copy to avoid modifying original
+    agent_kwargs = dict(agent_kwargs)
+
+    # Use orthogonal init by default
+    agent_kwargs.setdefault("use_orthogonal_init", True)
 
     config = {
         "env": env,
         "env_params": env_params,
-        # Network architecture - use Octax CNN (auto-detected from 3D obs, specified via discrete_cnn_type)
-        "discrete_cnn_type": "octax",
-        "agent_kwargs": {
-            "mlp_hidden_sizes": mlp_hidden_sizes,
-            "activation": activation,
-            "use_bias": ortho_mode is None,  # No bias when using orthogonal optimizer
-            "use_orthogonal_init": True,
-        },
+        "agent_kwargs": agent_kwargs,
         # PPO hyperparameters (from Octax paper)
         "num_envs": num_envs,
         "num_steps": 32,
@@ -190,7 +188,7 @@ def create_octax_ppo(
         "ortho_exclude_output": True,
     }
 
-    return PPO.create(**config)
+    return PPOOctax.create(**config)
 
 
 # =============================================================================
@@ -223,12 +221,11 @@ class OctaxContinualTrainer:
         # Total tasks = games * cycles
         self.total_tasks = len(task_order) * num_cycles
 
-    def _create_ppo_for_task(self, game: str) -> PPO:
-        """Create PPO instance for a specific game."""
+    def _create_ppo_for_task(self, game: str) -> PPOOctax:
+        """Create PPOOctax instance for a specific game."""
         return create_octax_ppo(
             game=game,
-            mlp_hidden_sizes=self.config.get("mlp_hidden_sizes", (64, 64, 64, 64)),
-            activation=self.config.get("activation", "relu"),
+            agent_kwargs=self.config.get("agent_kwargs", None),
             ortho_mode=self.config.get("ortho_mode", None),
             ortho_coeff=self.config.get("ortho_coeff", 0.1),
             normalize_rewards=self.config.get("normalize_rewards", False),
@@ -238,14 +235,17 @@ class OctaxContinualTrainer:
         )
 
     def _transfer_params(self, old_ts, new_ppo, rng):
-        """Transfer network parameters from old task to new task."""
+        """Transfer network parameters from old task to new task.
+
+        PPOOctax uses a shared backbone (single agent_ts) instead of
+        separate actor_ts/critic_ts.
+        """
         # Initialize new train state
         new_ts = new_ppo.init_state(rng)
 
-        # Transfer actor and critic parameters
+        # Transfer shared agent parameters (PPOOctax has single agent_ts)
         new_ts = new_ts.replace(
-            actor_ts=new_ts.actor_ts.replace(params=old_ts.actor_ts.params),
-            critic_ts=new_ts.critic_ts.replace(params=old_ts.critic_ts.params),
+            agent_ts=new_ts.agent_ts.replace(params=old_ts.agent_ts.params),
         )
 
         # Transfer reward normalization state if enabled
@@ -293,25 +293,25 @@ class OctaxContinualTrainer:
                 eval_lengths, eval_returns = metrics
                 num_evals = eval_returns.shape[0]
 
-                # Compute diagnostic metrics (gram deviation, l2_init distance)
-                _, actor_gram = compute_gram_regularization_loss(
-                    train_state.actor_ts.params, lambda_coeff=1.0, exclude_output=True
-                )
-                _, critic_gram = compute_gram_regularization_loss(
-                    train_state.critic_ts.params, lambda_coeff=1.0, exclude_output=True
-                )
-                _, actor_l2 = compute_l2_init_loss(
-                    train_state.actor_ts.params, train_state.actor_init_params, lambda_coeff=1.0
-                )
-                _, critic_l2 = compute_l2_init_loss(
-                    train_state.critic_ts.params, train_state.critic_init_params, lambda_coeff=1.0
-                )
+                # Compute diagnostic metrics (gram deviation)
+                # PPOOctax uses shared backbone, so we compute metrics on agent_ts
+                try:
+                    _, agent_gram = compute_gram_regularization_loss(
+                        train_state.agent_ts.params, lambda_coeff=1.0, exclude_output=True
+                    )
+                    gram_agent_val = float(agent_gram["ortho/total_loss"])
+                except Exception as e:
+                    print(f"    Warning: Could not compute gram metrics: {e}")
+                    gram_agent_val = 0.0
+
+                # Note: l2_init not available for PPOOctax (no init_params stored)
+                # Could add this later if needed
 
                 diagnostics = {
-                    "gram/actor": float(actor_gram["ortho/total_loss"]),
-                    "gram/critic": float(critic_gram["ortho/total_loss"]),
-                    "l2_init/actor": float(actor_l2["l2_init/total_distance"]),
-                    "l2_init/critic": float(critic_l2["l2_init/total_distance"]),
+                    "gram/actor": gram_agent_val,  # Keep key for backward compat
+                    "gram/critic": gram_agent_val,  # Same value (shared backbone)
+                    "l2_init/actor": 0.0,
+                    "l2_init/critic": 0.0,
                 }
 
                 # Store learning curves with global timestep
@@ -463,14 +463,13 @@ def run_smoke_test(output_dir: Path):
     print("="*70 + "\n")
 
     test_config = {
-        "mlp_hidden_sizes": (32, 32),
-        "activation": "relu",
+        "agent_kwargs": {"mlp_hidden_sizes": (32, 32), "activation": "relu"},
         "ortho_mode": None,
         "normalize_rewards": False,
     }
 
     trainer = OctaxContinualTrainer(
-        task_order=["brix", "pong"],  # Just 2 games
+        task_order=["brix", "submarine"],  # Just 2 games from OCTAX_GAMES
         num_cycles=1,
         steps_per_task=50_000,
         config=test_config,
