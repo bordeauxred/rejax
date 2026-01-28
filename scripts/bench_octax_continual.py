@@ -215,6 +215,8 @@ class OctaxContinualTrainer:
         output_dir: Optional[Path] = None,
         num_envs: int = 512,
         use_wandb: bool = False,
+        wandb_project: str = "octax-continual",
+        base_seed: int = 0,
     ):
         self.task_order = task_order
         self.num_cycles = num_cycles
@@ -225,6 +227,8 @@ class OctaxContinualTrainer:
         self.output_dir = Path(output_dir) if output_dir else None
         self.num_envs = num_envs
         self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.wandb_project = wandb_project
+        self.base_seed = base_seed
 
         # Total tasks = games * cycles
         self.total_tasks = len(task_order) * num_cycles
@@ -262,9 +266,10 @@ class OctaxContinualTrainer:
 
         return new_ts
 
-    def train_single_seed(self, seed: int) -> Dict[str, Any]:
+    def train_single_seed(self, seed_idx: int, config_name: str) -> Dict[str, Any]:
         """Train continual learning for a single seed."""
-        rng = jax.random.PRNGKey(seed)
+        actual_seed = self.base_seed + seed_idx
+        rng = jax.random.PRNGKey(actual_seed)
 
         # Storage for learning curves
         all_returns = []  # List of (task_idx, game, timestep, returns)
@@ -276,7 +281,7 @@ class OctaxContinualTrainer:
         for cycle in range(self.num_cycles):
             for task_idx_in_cycle, game in enumerate(self.task_order):
                 task_idx = cycle * len(self.task_order) + task_idx_in_cycle
-                print(f"  Seed {seed} | Cycle {cycle+1}/{self.num_cycles} | "
+                print(f"  Seed {actual_seed} | Cycle {cycle+1}/{self.num_cycles} | "
                       f"Task {task_idx+1}/{self.total_tasks}: {game}")
 
                 # Create PPO for this game
@@ -362,7 +367,7 @@ class OctaxContinualTrainer:
                       f"l2_init: actor={diagnostics['l2_init/actor']:.2f}, critic={diagnostics['l2_init/critic']:.2f}")
 
         return {
-            "seed": seed,
+            "seed": actual_seed,
             "learning_curves": all_returns,
             "task_boundaries": task_boundaries,
             "total_steps": global_step,
@@ -380,12 +385,34 @@ class OctaxContinualTrainer:
         start_time = time.time()
         all_seed_results = []
 
-        for seed in range(self.num_seeds):
+        for seed_idx in range(self.num_seeds):
+            actual_seed = self.base_seed + seed_idx
+
+            # Initialize wandb per seed (like MinAtar script)
+            if self.use_wandb:
+                wandb.init(
+                    project=self.wandb_project,
+                    name=f"{config_name}_seed{actual_seed}",
+                    config={
+                        "experiment": config_name,
+                        "config": self.config,
+                        "task_order": self.task_order,
+                        "num_cycles": self.num_cycles,
+                        "steps_per_task": self.steps_per_task,
+                        "num_envs": self.num_envs,
+                        "seed": actual_seed,
+                    },
+                    reinit=True,
+                )
+
             seed_start = time.time()
-            result = self.train_single_seed(seed)
+            result = self.train_single_seed(seed_idx, config_name)
             seed_time = time.time() - seed_start
-            print(f"  Seed {seed} completed in {seed_time/60:.1f} min")
+            print(f"  Seed {actual_seed} completed in {seed_time/60:.1f} min")
             all_seed_results.append(result)
+
+            if self.use_wandb:
+                wandb.finish()
 
         total_time = time.time() - start_time
         print(f"\nTotal time: {total_time/60:.1f} min ({total_time/3600:.2f} hours)")
@@ -492,21 +519,9 @@ def run_smoke_test(output_dir: Path, num_envs: int = 128, steps_per_task: int = 
         "normalize_rewards": False,
     }
 
-    # Initialize wandb for smoke test
-    if use_wandb and WANDB_AVAILABLE:
-        wandb.init(
-            project=wandb_project,
-            name="smoke_test_adamo_groupsort",
-            config={
-                "experiment": "smoke_test",
-                "config": test_config,
-                "steps_per_task": steps_per_task,
-                "num_envs": num_envs,
-            },
-        )
-
     eval_freq = max(steps_per_task // 20, 25_000)  # ~20 eval points per task
 
+    # wandb is initialized per-seed inside the trainer (with seed in run name)
     trainer = OctaxContinualTrainer(
         task_order=["brix", "submarine"],  # Just 2 games from OCTAX_GAMES
         num_cycles=1,
@@ -517,6 +532,7 @@ def run_smoke_test(output_dir: Path, num_envs: int = 128, steps_per_task: int = 
         output_dir=output_dir,
         num_envs=num_envs,
         use_wandb=use_wandb,
+        wandb_project=wandb_project,
     )
 
     start = time.time()
@@ -561,9 +577,6 @@ def run_smoke_test(output_dir: Path, num_envs: int = 128, steps_per_task: int = 
     print("\n" + "="*70)
     print("SMOKE TEST PASSED!")
     print("="*70 + "\n")
-
-    if use_wandb and WANDB_AVAILABLE:
-        wandb.finish()
 
     return True
 
@@ -766,6 +779,8 @@ def main():
                         help="Enable wandb logging")
     parser.add_argument("--wandb-project", type=str, default="octax-continual",
                         help="Wandb project name")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Base random seed")
     args = parser.parse_args()
 
     # Create output directory
@@ -798,23 +813,7 @@ def main():
     for config_name in args.configs:
         config = EXPERIMENT_CONFIGS[config_name]
 
-        # Initialize wandb for each config
-        if args.wandb and WANDB_AVAILABLE:
-            wandb.init(
-                project=args.wandb_project,
-                name=f"continual_{config_name}",
-                config={
-                    "experiment": config_name,
-                    "config": config,
-                    "task_order": TASK_ORDER,
-                    "num_cycles": args.num_cycles,
-                    "steps_per_task": args.steps_per_task,
-                    "num_seeds": args.num_seeds,
-                    "num_envs": args.num_envs,
-                },
-                reinit=True,
-            )
-
+        # wandb is initialized per-seed inside the trainer (with seed in run name)
         trainer = OctaxContinualTrainer(
             task_order=TASK_ORDER,
             num_cycles=args.num_cycles,
@@ -825,12 +824,11 @@ def main():
             output_dir=args.output_dir,
             num_envs=args.num_envs,
             use_wandb=args.wandb,
+            wandb_project=args.wandb_project,
+            base_seed=args.seed,
         )
 
         trainer.run(config_name)
-
-        if args.wandb and WANDB_AVAILABLE:
-            wandb.finish()
 
     # Plot results
     print("\nGenerating plots...")
