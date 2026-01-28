@@ -628,12 +628,39 @@ EXPERIMENT_CONFIGS_MLP = [
         "use_bias": False,
         "use_orthogonal_init": True,
     },
-    # Small network variants with L2-Init
+    # Small network variants with L2-Init (64x3)
     {
         "name": "mlp_l2_init_small",
         "network_type": "mlp",
         "hidden_layer_sizes": (64, 64, 64),
         "l2_init_coeff": 0.001,
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    # Small network variants with L2-Init (64x4) - matches paper experiment
+    {
+        "name": "mlp_l2_init_small4",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "l2_init_coeff": 0.001,
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
+        "use_orthogonal_init": True,
+    },
+    {
+        "name": "mlp_l2_init_small4_0.01",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "l2_init_coeff": 0.01,  # Higher coefficient
         "ortho_mode": None,
         "activation": "relu",
         "lr_schedule": "constant",
