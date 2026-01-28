@@ -14,6 +14,22 @@
 
 set -e
 
+# Quick test mode: just run one job (brix + 256x1)
+if [ "$1" = "--test" ] || [ "$1" = "-t" ]; then
+    echo "=== TEST MODE: Single job (brix + 256x1) ==="
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+    STEPS=${2:-1000000}
+    NUM_ENVS=${3:-2048}
+    mkdir -p results/popart_single_task/logs
+    uv run python scripts/bench_octax_popart.py \
+        --game brix --arch 256x1 \
+        --steps $STEPS --num-envs $NUM_ENVS --num-seeds 2 \
+        --output results/popart_single_task/brix_256x1.json \
+        2>&1 | tee results/popart_single_task/logs/brix_256x1.log
+    exit 0
+fi
+
 STEPS=${1:-5000000}
 PARALLEL=${2:-3}  # Number of parallel jobs (3 fits comfortably on H100 40GB)
 NUM_ENVS=${3:-2048}
