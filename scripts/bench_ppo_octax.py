@@ -200,8 +200,9 @@ def run_ppo_octax(
     jax.block_until_ready(train_states)
     elapsed = time.time() - start
 
+    steps_per_sec = total_timesteps * num_seeds / elapsed
     print(f"Done in {elapsed:.1f}s")
-    print(f"Steps/sec: {total_timesteps * num_seeds / elapsed:,.0f}")
+    print(f"Steps/sec: {steps_per_sec:,.0f}")
 
     # Evaluate
     all_returns = []
@@ -229,12 +230,16 @@ def run_ppo_octax(
             "eval/std_return": std_return,
             "eval/min_return": min(all_returns),
             "eval/max_return": max(all_returns),
-            "train/steps_per_sec": total_timesteps * num_seeds / elapsed,
-            "train/total_time_sec": elapsed,
+            "throughput/steps_per_sec": steps_per_sec,
+            "throughput/total_time_sec": elapsed,
+            "throughput/time_per_1M_steps": elapsed / (total_timesteps * num_seeds / 1_000_000),
         })
         for i, ret in enumerate(all_returns):
             wandb.log({f"eval/seed_{i}_return": ret})
         wandb.finish()
+
+    # Print throughput summary
+    print(f"Throughput: {steps_per_sec:,.0f} steps/sec | {elapsed / (total_timesteps * num_seeds / 1_000_000):.1f}s per 1M steps")
 
     return all_returns, mean_return
 
