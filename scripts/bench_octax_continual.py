@@ -31,6 +31,7 @@ import numpy as np
 from rejax import PPO
 from rejax.evaluate import evaluate
 from rejax.compat.octax2gymnax import create_octax
+from rejax.regularization import compute_gram_regularization_loss, compute_l2_init_loss
 
 
 # =============================================================================
@@ -292,6 +293,27 @@ class OctaxContinualTrainer:
                 eval_lengths, eval_returns = metrics
                 num_evals = eval_returns.shape[0]
 
+                # Compute diagnostic metrics (gram deviation, l2_init distance)
+                _, actor_gram = compute_gram_regularization_loss(
+                    train_state.actor_ts.params, lambda_coeff=1.0, exclude_output=True
+                )
+                _, critic_gram = compute_gram_regularization_loss(
+                    train_state.critic_ts.params, lambda_coeff=1.0, exclude_output=True
+                )
+                _, actor_l2 = compute_l2_init_loss(
+                    train_state.actor_ts.params, train_state.actor_init_params, lambda_coeff=1.0
+                )
+                _, critic_l2 = compute_l2_init_loss(
+                    train_state.critic_ts.params, train_state.critic_init_params, lambda_coeff=1.0
+                )
+
+                diagnostics = {
+                    "gram/actor": float(actor_gram["ortho/total_loss"]),
+                    "gram/critic": float(critic_gram["ortho/total_loss"]),
+                    "l2_init/actor": float(actor_l2["l2_init/total_distance"]),
+                    "l2_init/critic": float(critic_l2["l2_init/total_distance"]),
+                }
+
                 # Store learning curves with global timestep
                 for eval_idx in range(num_evals):
                     timestep = global_step + (eval_idx + 1) * self.eval_freq
@@ -304,13 +326,17 @@ class OctaxContinualTrainer:
                         "local_step": (eval_idx + 1) * self.eval_freq,
                         "mean_return": mean_ret,
                         "std_return": float(eval_returns[eval_idx].std()),
+                        # Include diagnostics at final eval point of each task
+                        **(diagnostics if eval_idx == num_evals - 1 else {}),
                     })
 
                 global_step += self.steps_per_task
 
-                # Print final return for this task
+                # Print final return for this task with diagnostics
                 final_return = float(eval_returns[-1].mean())
-                print(f"    Final return: {final_return:.1f}")
+                print(f"    Final return: {final_return:.1f} | "
+                      f"gram: actor={diagnostics['gram/actor']:.4f}, critic={diagnostics['gram/critic']:.4f} | "
+                      f"l2_init: actor={diagnostics['l2_init/actor']:.2f}, critic={diagnostics['l2_init/critic']:.2f}")
 
         return {
             "seed": seed,
@@ -377,11 +403,26 @@ class OctaxContinualTrainer:
         all_returns = np.zeros((self.num_seeds, total_evals))
         all_timesteps = np.zeros(total_evals)
 
+        # Diagnostic metrics at task boundaries: (num_seeds, total_tasks)
+        gram_actor = np.zeros((self.num_seeds, self.total_tasks))
+        gram_critic = np.zeros((self.num_seeds, self.total_tasks))
+        l2_init_actor = np.zeros((self.num_seeds, self.total_tasks))
+        l2_init_critic = np.zeros((self.num_seeds, self.total_tasks))
+
         for seed_idx, seed_result in enumerate(results["seed_results"]):
+            task_diag_idx = 0
             for eval_idx, curve_point in enumerate(seed_result["learning_curves"]):
                 if eval_idx < total_evals:
                     all_returns[seed_idx, eval_idx] = curve_point["mean_return"]
                     all_timesteps[eval_idx] = curve_point["global_step"]
+
+                # Capture diagnostics at task boundaries (last eval of each task)
+                if "gram/actor" in curve_point and task_diag_idx < self.total_tasks:
+                    gram_actor[seed_idx, task_diag_idx] = curve_point["gram/actor"]
+                    gram_critic[seed_idx, task_diag_idx] = curve_point["gram/critic"]
+                    l2_init_actor[seed_idx, task_diag_idx] = curve_point["l2_init/actor"]
+                    l2_init_critic[seed_idx, task_diag_idx] = curve_point["l2_init/critic"]
+                    task_diag_idx += 1
 
         # Task boundaries
         task_boundaries = []
@@ -398,6 +439,11 @@ class OctaxContinualTrainer:
             task_boundaries=np.array(task_boundaries),
             task_order=self.task_order * self.num_cycles,
             config=self.config,
+            # Diagnostic metrics at task boundaries
+            gram_actor=gram_actor,  # (num_seeds, total_tasks)
+            gram_critic=gram_critic,
+            l2_init_actor=l2_init_actor,
+            l2_init_critic=l2_init_critic,
         )
         print(f"Saved curves: {filename}")
 
@@ -502,6 +548,9 @@ def plot_continual_results(output_dir: Path):
 
     print(f"Plotting {len(npz_files)} experiments...")
 
+    # =========================================================================
+    # Plot 1: Learning curves
+    # =========================================================================
     fig, ax = plt.subplots(figsize=(14, 6))
 
     for npz_file in npz_files:
@@ -544,6 +593,102 @@ def plot_continual_results(output_dir: Path):
 
     plt.tight_layout()
     plot_file = output_dir / "continual_learning_curves.png"
+    plt.savefig(plot_file, dpi=150, bbox_inches="tight")
+    print(f"Saved: {plot_file}")
+    plt.close()
+
+    # =========================================================================
+    # Plot 2: Gram deviation (orthogonality diagnostic)
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for npz_file in npz_files:
+        data = np.load(npz_file, allow_pickle=True)
+        config_name = npz_file.stem.replace("continual_", "").replace("_curves", "")
+
+        if "gram_actor" not in data:
+            continue
+
+        task_indices = np.arange(len(data["gram_actor"].mean(axis=0)))
+
+        # Actor gram
+        gram_actor_mean = data["gram_actor"].mean(axis=0)
+        gram_actor_std = data["gram_actor"].std(axis=0)
+        axes[0].plot(task_indices, gram_actor_mean, label=config_name, marker='o', markersize=4)
+        axes[0].fill_between(task_indices, gram_actor_mean - gram_actor_std,
+                             gram_actor_mean + gram_actor_std, alpha=0.2)
+
+        # Critic gram
+        gram_critic_mean = data["gram_critic"].mean(axis=0)
+        gram_critic_std = data["gram_critic"].std(axis=0)
+        axes[1].plot(task_indices, gram_critic_mean, label=config_name, marker='o', markersize=4)
+        axes[1].fill_between(task_indices, gram_critic_mean - gram_critic_std,
+                             gram_critic_mean + gram_critic_std, alpha=0.2)
+
+    axes[0].set_xlabel("Task Index")
+    axes[0].set_ylabel("Gram Deviation (||W'W - I||)")
+    axes[0].set_title("Actor Gram Deviation")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+    axes[0].set_yscale("log")
+
+    axes[1].set_xlabel("Task Index")
+    axes[1].set_ylabel("Gram Deviation (||W'W - I||)")
+    axes[1].set_title("Critic Gram Deviation")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+    axes[1].set_yscale("log")
+
+    plt.suptitle("Orthogonality: Lower = Weights Closer to Orthonormal", fontsize=12)
+    plt.tight_layout()
+    plot_file = output_dir / "continual_gram_deviation.png"
+    plt.savefig(plot_file, dpi=150, bbox_inches="tight")
+    print(f"Saved: {plot_file}")
+    plt.close()
+
+    # =========================================================================
+    # Plot 3: L2-init distance (weight drift from initialization)
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for npz_file in npz_files:
+        data = np.load(npz_file, allow_pickle=True)
+        config_name = npz_file.stem.replace("continual_", "").replace("_curves", "")
+
+        if "l2_init_actor" not in data:
+            continue
+
+        task_indices = np.arange(len(data["l2_init_actor"].mean(axis=0)))
+
+        # Actor l2_init
+        l2_actor_mean = data["l2_init_actor"].mean(axis=0)
+        l2_actor_std = data["l2_init_actor"].std(axis=0)
+        axes[0].plot(task_indices, l2_actor_mean, label=config_name, marker='o', markersize=4)
+        axes[0].fill_between(task_indices, l2_actor_mean - l2_actor_std,
+                             l2_actor_mean + l2_actor_std, alpha=0.2)
+
+        # Critic l2_init
+        l2_critic_mean = data["l2_init_critic"].mean(axis=0)
+        l2_critic_std = data["l2_init_critic"].std(axis=0)
+        axes[1].plot(task_indices, l2_critic_mean, label=config_name, marker='o', markersize=4)
+        axes[1].fill_between(task_indices, l2_critic_mean - l2_critic_std,
+                             l2_critic_mean + l2_critic_std, alpha=0.2)
+
+    axes[0].set_xlabel("Task Index")
+    axes[0].set_ylabel("L2 Distance from Init")
+    axes[0].set_title("Actor Weight Drift")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    axes[1].set_xlabel("Task Index")
+    axes[1].set_ylabel("L2 Distance from Init")
+    axes[1].set_title("Critic Weight Drift")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    plt.suptitle("Weight Drift: How Far Weights Have Moved from Initialization", fontsize=12)
+    plt.tight_layout()
+    plot_file = output_dir / "continual_l2_init.png"
     plt.savefig(plot_file, dpi=150, bbox_inches="tight")
     print(f"Saved: {plot_file}")
     plt.close()
