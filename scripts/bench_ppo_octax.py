@@ -27,9 +27,11 @@ import argparse
 import time
 import warnings
 from copy import copy
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from rejax import PPOOctax
 from rejax.evaluate import evaluate
@@ -119,6 +121,7 @@ def run_ppo_octax(
     normalize_rewards: bool = False,
     unified: bool = False,
     use_wandb: bool = False,
+    output_dir: Path = None,
 ):
     """Run our PPOOctax implementation."""
     # Format MLP string for logging
@@ -223,6 +226,40 @@ def run_ppo_octax(
     std_return = (sum((r - mean_return) ** 2 for r in all_returns) / len(all_returns)) ** 0.5
     print(f"\nMean return: {mean_return:.1f} ± {std_return:.1f}")
 
+    # Save learning curves locally (fast, no network overhead)
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # metrics = (lengths, returns) with shape (num_seeds, num_evals, 128)
+        eval_lengths, eval_returns = metrics
+
+        # Compute timesteps for x-axis
+        eval_freq = config["eval_freq"]
+        num_evals = eval_returns.shape[1]
+        timesteps = np.arange(1, num_evals + 1) * eval_freq
+
+        norm_str = "norm" if normalize_rewards else "no_norm"
+        filename = output_dir / f"{game}_{mlp_str}_{norm_str}_curves.npz"
+
+        np.savez(
+            filename,
+            timesteps=timesteps,
+            eval_returns=np.array(eval_returns),  # (num_seeds, num_evals, 128)
+            eval_lengths=np.array(eval_lengths),
+            mean_returns=np.array(eval_returns).mean(axis=2),  # (num_seeds, num_evals)
+            config={
+                "game": game,
+                "mlp_str": mlp_str,
+                "mlp_hidden_sizes": mlp_hidden_sizes,
+                "num_seeds": num_seeds,
+                "total_timesteps": total_timesteps,
+                "eval_freq": eval_freq,
+                "normalize_rewards": normalize_rewards,
+            },
+        )
+        print(f"Saved learning curves: {filename}")
+
     # Log to wandb
     if use_wandb:
         wandb.log({
@@ -255,6 +292,7 @@ def main():
     parser.add_argument("--normalize-rewards", action="store_true", help="Enable reward normalization")
     parser.add_argument("--unified", action="store_true", help="Use unified action space (6 actions)")
     parser.add_argument("--use-wandb", action="store_true", help="Log to Weights & Biases")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Save learning curves to this directory")
     args = parser.parse_args()
 
     # Parse MLP config
@@ -274,6 +312,7 @@ def main():
         normalize_rewards=args.normalize_rewards,
         unified=args.unified,
         use_wandb=args.use_wandb,
+        output_dir=args.output_dir,
     )
 
 
