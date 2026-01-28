@@ -23,10 +23,9 @@ NUM_CYCLES=${2:-20}
 EVAL_FREQ=${3:-500000}
 NUM_ENVS=${4:-2048}
 
-# Prevent JAX from pre-allocating all GPU memory
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# Use platform allocator to reduce fragmentation (allocates contiguous blocks)
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+# Limit each process to 5% of GPU memory (~4GB on H100)
+# 8 processes × 4GB = 32GB total, leaves headroom for other work
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.05
 
 # Same output locations as main experiment for easy comparison
 EXPERIMENT_NAME="paper_continual_64x4_permuted"
