@@ -27,7 +27,7 @@ OUTPUT_DIR="results/octax_continual"
 
 if [ "$1" == "smoke" ]; then
     echo "Running smoke test..."
-    python scripts/bench_octax_continual.py --smoke-test --output-dir "$OUTPUT_DIR"
+    uv run python scripts/bench_octax_continual.py --smoke-test --output-dir "$OUTPUT_DIR"
     echo ""
     echo "Smoke test passed! Run full experiment with:"
     echo "  ./scripts/run_octax_continual.sh"
@@ -36,7 +36,7 @@ fi
 
 if [ "$1" == "plot" ]; then
     echo "Plotting results..."
-    python scripts/bench_octax_continual.py --plot-only --output-dir "$OUTPUT_DIR"
+    uv run python scripts/bench_octax_continual.py --plot-only --output-dir "$OUTPUT_DIR"
     exit 0
 fi
 
