@@ -28,6 +28,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from rejax import PPOOctax
 from rejax.evaluate import evaluate
 from rejax.compat.octax2gymnax import create_octax
@@ -208,6 +214,7 @@ class OctaxContinualTrainer:
         eval_freq: int = 250_000,
         output_dir: Optional[Path] = None,
         num_envs: int = 512,
+        use_wandb: bool = False,
     ):
         self.task_order = task_order
         self.num_cycles = num_cycles
@@ -217,6 +224,7 @@ class OctaxContinualTrainer:
         self.eval_freq = eval_freq
         self.output_dir = Path(output_dir) if output_dir else None
         self.num_envs = num_envs
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
 
         # Total tasks = games * cycles
         self.total_tasks = len(task_order) * num_cycles
@@ -318,6 +326,7 @@ class OctaxContinualTrainer:
                 for eval_idx in range(num_evals):
                     timestep = global_step + (eval_idx + 1) * self.eval_freq
                     mean_ret = float(eval_returns[eval_idx].mean())
+                    std_ret = float(eval_returns[eval_idx].std())
                     all_returns.append({
                         "task_idx": task_idx,
                         "game": game,
@@ -325,10 +334,24 @@ class OctaxContinualTrainer:
                         "global_step": timestep,
                         "local_step": (eval_idx + 1) * self.eval_freq,
                         "mean_return": mean_ret,
-                        "std_return": float(eval_returns[eval_idx].std()),
+                        "std_return": std_ret,
                         # Include diagnostics at final eval point of each task
                         **(diagnostics if eval_idx == num_evals - 1 else {}),
                     })
+
+                    # Log to wandb
+                    if self.use_wandb:
+                        log_data = {
+                            "global_step": timestep,
+                            "mean_return": mean_ret,
+                            "std_return": std_ret,
+                            "task_idx": task_idx,
+                            "game": game,
+                            "cycle": cycle,
+                        }
+                        if eval_idx == num_evals - 1:
+                            log_data.update(diagnostics)
+                        wandb.log(log_data, step=timestep)
 
                 global_step += self.steps_per_task
 
@@ -452,7 +475,7 @@ class OctaxContinualTrainer:
 # Smoke Test
 # =============================================================================
 
-def run_smoke_test(output_dir: Path):
+def run_smoke_test(output_dir: Path, num_envs: int = 128, steps_per_task: int = 50_000, use_wandb: bool = False, wandb_project: str = "octax-continual"):
     """Quick smoke test to verify the full pipeline.
 
     Note: On CPU this will be slow due to JAX compilation.
@@ -463,20 +486,37 @@ def run_smoke_test(output_dir: Path):
     print("="*70 + "\n")
 
     test_config = {
-        "agent_kwargs": {"mlp_hidden_sizes": (32, 32), "activation": "relu"},
-        "ortho_mode": None,
+        "agent_kwargs": {"mlp_hidden_sizes": (64, 64, 64, 64), "activation": "groupsort"},
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
         "normalize_rewards": False,
     }
+
+    # Initialize wandb for smoke test
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=wandb_project,
+            name="smoke_test_adamo_groupsort",
+            config={
+                "experiment": "smoke_test",
+                "config": test_config,
+                "steps_per_task": steps_per_task,
+                "num_envs": num_envs,
+            },
+        )
+
+    eval_freq = max(steps_per_task // 20, 25_000)  # ~20 eval points per task
 
     trainer = OctaxContinualTrainer(
         task_order=["brix", "submarine"],  # Just 2 games from OCTAX_GAMES
         num_cycles=1,
-        steps_per_task=50_000,
+        steps_per_task=steps_per_task,
         config=test_config,
         num_seeds=1,
-        eval_freq=25_000,
+        eval_freq=eval_freq,
         output_dir=output_dir,
-        num_envs=128,  # Smaller for faster compilation
+        num_envs=num_envs,
+        use_wandb=use_wandb,
     )
 
     start = time.time()
@@ -521,6 +561,9 @@ def run_smoke_test(output_dir: Path):
     print("\n" + "="*70)
     print("SMOKE TEST PASSED!")
     print("="*70 + "\n")
+
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
 
     return True
 
@@ -719,6 +762,10 @@ def main():
                         help="Output directory for results")
     parser.add_argument("--plot-only", action="store_true",
                         help="Only plot existing results, don't train")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="octax-continual",
+                        help="Wandb project name")
     args = parser.parse_args()
 
     # Create output directory
@@ -732,7 +779,13 @@ def main():
     # Smoke test mode
     if args.smoke_test:
         smoke_dir = args.output_dir / "smoke_test"
-        success = run_smoke_test(smoke_dir)
+        success = run_smoke_test(
+            smoke_dir,
+            num_envs=args.num_envs,
+            steps_per_task=args.steps_per_task,
+            use_wandb=args.wandb,
+            wandb_project=args.wandb_project,
+        )
         if success:
             print("\nYou can now run the full experiment with:")
             print(f"  python scripts/bench_octax_continual.py --output-dir {args.output_dir}")
@@ -745,6 +798,23 @@ def main():
     for config_name in args.configs:
         config = EXPERIMENT_CONFIGS[config_name]
 
+        # Initialize wandb for each config
+        if args.wandb and WANDB_AVAILABLE:
+            wandb.init(
+                project=args.wandb_project,
+                name=f"continual_{config_name}",
+                config={
+                    "experiment": config_name,
+                    "config": config,
+                    "task_order": TASK_ORDER,
+                    "num_cycles": args.num_cycles,
+                    "steps_per_task": args.steps_per_task,
+                    "num_seeds": args.num_seeds,
+                    "num_envs": args.num_envs,
+                },
+                reinit=True,
+            )
+
         trainer = OctaxContinualTrainer(
             task_order=TASK_ORDER,
             num_cycles=args.num_cycles,
@@ -754,9 +824,13 @@ def main():
             eval_freq=args.eval_freq,
             output_dir=args.output_dir,
             num_envs=args.num_envs,
+            use_wandb=args.wandb,
         )
 
         trainer.run(config_name)
+
+        if args.wandb and WANDB_AVAILABLE:
+            wandb.finish()
 
     # Plot results
     print("\nGenerating plots...")
