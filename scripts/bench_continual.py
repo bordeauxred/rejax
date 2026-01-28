@@ -560,6 +560,20 @@ EXPERIMENT_CONFIGS_MLP = [
         "use_bias": False,
         "use_orthogonal_init": True,
     },
+    # AdamO with ReLU activation (ablation: orthogonalization without GroupSort)
+    {
+        "name": "mlp_adamo_relu_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "ortho_mode": "optimizer",
+        "ortho_coeff": 0.1,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": False,
+        "use_orthogonal_init": True,
+    },
     # Small network variants - 64x3 (shallower alternative)
     {
         "name": "mlp_baseline_small3",
