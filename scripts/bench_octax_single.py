@@ -63,7 +63,7 @@ class UnifiedOctaxEnv:
     """Wrapper that unifies action space across Octax games.
 
     For continual learning, all tasks must have the same input/output dimensions.
-    Octax observations are already unified to (64, 32, 4) by the HWCObsWrapper.
+    Octax observations are (4, 32, 64) CHW format - OctaxCNN handles transpose internally.
     This wrapper additionally:
     - Maps invalid actions to no-op (action 0)
     - Provides consistent action_space across games

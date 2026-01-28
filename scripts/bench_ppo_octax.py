@@ -73,11 +73,13 @@ class UnifiedOctaxEnv:
     Maps invalid actions (>= game's native actions) to no-op (action 0).
     """
     def __init__(self, env, game_name: str):
-        self._env = env
-        self.game_name = game_name
-        self.native_actions = OCTAX_GAMES[game_name]
+        object.__setattr__(self, '_env', env)
+        object.__setattr__(self, 'game_name', game_name)
+        object.__setattr__(self, 'native_actions', OCTAX_GAMES[game_name])
 
     def __getattr__(self, name):
+        if name in ('_env', 'game_name', 'native_actions'):
+            return object.__getattribute__(self, name)
         return getattr(self._env, name)
 
     @property
@@ -100,11 +102,11 @@ class UnifiedOctaxEnv:
         return self._env.step(key, state, valid_action, params)
 
     def __deepcopy__(self, memo):
-        warnings.warn(
-            f"Shallow copy of {type(self).__name__} (octax env may not support deepcopy)",
-            RuntimeWarning, stacklevel=2
-        )
-        return copy(self)
+        # Return self - octax envs don't need deepcopy, they're stateless
+        return self
+
+    def __copy__(self):
+        return self
 
 
 def run_ppo_octax(
