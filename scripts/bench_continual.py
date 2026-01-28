@@ -689,12 +689,13 @@ EXPERIMENT_CONFIGS_MLP = [
         "network_type": "mlp",
         "hidden_layer_sizes": (64, 64, 64, 64),
         "nap_enabled": True,
+        "use_nap_layernorm": True,  # Normalize (LayerNorm) and Project
         "ortho_mode": None,
         "activation": "relu",
         "lr_schedule": "constant",
         "learning_rate": 2.5e-4,
         "num_minibatches": 128,
-        "use_bias": True,
+        "use_bias": False,  # Paper: "we remove bias terms as these are made redundant by the learnable offset"
         "use_orthogonal_init": True,
     },
     # ==========================================================================
