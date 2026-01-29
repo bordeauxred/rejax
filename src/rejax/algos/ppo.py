@@ -33,6 +33,7 @@ from rejax.regularization import (
     compute_weight_norms,
     apply_nap_projection,
     compute_scale_regularization_loss,
+    compute_wsn_loss,
 )
 
 
@@ -84,6 +85,10 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     scale_enabled: bool = struct.field(pytree_node=False, default=False)
     scale_reg_coeff: Optional[chex.Scalar] = struct.field(pytree_node=True, default=0.01)  # log(α)² regularization
     scale_exclude_output: bool = struct.field(pytree_node=False, default=True)
+
+    # WSN (Weight Spectral Norm) regularization settings
+    wsn_coeff: Optional[chex.Scalar] = struct.field(pytree_node=True, default=None)  # None = disabled
+    wsn_exclude_output: bool = struct.field(pytree_node=False, default=True)
 
     def make_act(self, ts):
         def act(obs, rng):
@@ -483,6 +488,15 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                 )
                 total_loss = total_loss + scale_loss
 
+            # Add WSN (Weight Spectral Norm) loss if enabled
+            if self.wsn_coeff is not None:
+                wsn_loss, _ = compute_wsn_loss(
+                    params,
+                    lambda_coeff=self.wsn_coeff,
+                    exclude_output=self.wsn_exclude_output,
+                )
+                total_loss = total_loss + wsn_loss
+
             return total_loss, (pi_loss, entropy, approx_kl, clip_fraction)
 
         grads, (pi_loss, entropy, approx_kl, clip_fraction) = jax.grad(
@@ -556,6 +570,15 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                     exclude_output=self.scale_exclude_output,
                 )
                 total_loss = total_loss + scale_loss
+
+            # Add WSN (Weight Spectral Norm) loss if enabled
+            if self.wsn_coeff is not None:
+                wsn_loss, _ = compute_wsn_loss(
+                    params,
+                    lambda_coeff=self.wsn_coeff,
+                    exclude_output=self.wsn_exclude_output,
+                )
+                total_loss = total_loss + wsn_loss
 
             return total_loss, value_loss
 

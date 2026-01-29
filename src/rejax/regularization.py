@@ -30,6 +30,10 @@ def adaptive_gram_loss(W: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     n_in, n_out = W.shape
 
+    # Handle edge case of zero dimensions
+    if n_in == 0 or n_out == 0:
+        return jnp.array(0.0), jnp.zeros((1, 1))
+
     if n_in < n_out:
         # Wide matrix: enforce row orthogonality
         gram = jnp.matmul(W, W.T)
@@ -656,3 +660,125 @@ def apply_nap_projection(
             updated_params[path] = W * scale
 
     return unflatten_dict(updated_params, sep="/")
+
+
+def compute_wsn_loss(
+    params: Dict,
+    lambda_coeff: float = 0.001,
+    num_power_iters: int = 1,
+    exclude_output: bool = True,
+    rng_key: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, Dict[str, Any]]:
+    """
+    Compute Weight Spectral Norm (WSN) regularization loss.
+
+    Drives the squared spectral norm of each weight matrix towards 1:
+    loss = λ * Σ (σ²(W) - 1)²
+
+    where σ(W) is the largest singular value (spectral norm) of W,
+    estimated via power iteration.
+
+    Reference: Lewandowski et al. 2025
+
+    Args:
+        params: Parameter dictionary (PyTree)
+        lambda_coeff: Regularization coefficient (recommended: 0.001)
+        num_power_iters: Number of power iteration steps (1 is usually enough)
+        exclude_output: Whether to exclude the output layer
+        rng_key: Optional JAX random key for initializing power iteration
+
+    Returns:
+        (weighted_loss, metrics): The weighted loss and diagnostic metrics
+    """
+    kernels = get_dense_kernels(params)
+    kernel_paths = list(kernels.keys())
+
+    # Identify output layer to exclude
+    layers_to_exclude = set()
+    if exclude_output and kernel_paths:
+        output_path = _find_output_layer_path(kernel_paths)
+        if output_path:
+            layers_to_exclude.add(output_path)
+
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(0)
+
+    total_penalty = jnp.array(0.0)
+    metrics = {}
+
+    for path in kernel_paths:
+        if path in layers_to_exclude:
+            continue
+
+        W = kernels[path]
+
+        # Handle ensemble dimension (vmapped parameters)
+        if W.ndim == 3:
+            # For ensembles, average the penalty across members
+            def single_wsn_penalty(w, key):
+                return _compute_single_wsn_penalty(w, num_power_iters, key)
+            rng_key, *subkeys = jax.random.split(rng_key, W.shape[0] + 1)
+            penalties = jax.vmap(single_wsn_penalty)(W, jnp.array(subkeys))
+            penalty = jnp.mean(penalties)
+        elif W.ndim == 2:
+            rng_key, subkey = jax.random.split(rng_key)
+            penalty, _ = _compute_single_wsn_penalty_with_sigma(W, num_power_iters, subkey)
+        else:
+            continue
+
+        total_penalty = total_penalty + penalty
+
+        # Store per-layer metrics
+        layer_name = path.replace('/kernel', '').replace('params/', '')
+        metrics[f'wsn/{layer_name}/penalty'] = penalty
+
+    weighted_loss = lambda_coeff * total_penalty
+    metrics['wsn/total_penalty'] = total_penalty
+    metrics['wsn/weighted_loss'] = weighted_loss
+
+    return weighted_loss, metrics
+
+
+def _compute_single_wsn_penalty(
+    W: jnp.ndarray,
+    num_power_iters: int,
+    rng_key: jnp.ndarray,
+) -> jnp.ndarray:
+    """Compute WSN penalty for a single weight matrix."""
+    penalty, _ = _compute_single_wsn_penalty_with_sigma(W, num_power_iters, rng_key)
+    return penalty
+
+
+def _compute_single_wsn_penalty_with_sigma(
+    W: jnp.ndarray,
+    num_power_iters: int,
+    rng_key: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Compute WSN penalty and estimated sigma² for a single weight matrix.
+
+    Uses power iteration on W^T @ W to estimate the largest singular value squared.
+    """
+    n_in, n_out = W.shape
+
+    # Initialize random vector for power iteration
+    v = jax.random.normal(rng_key, (n_out,))
+    v = v / (jnp.sqrt(jnp.sum(v ** 2)) + 1e-12)
+
+    def power_iter_step(v, _):
+        # v_new = W^T @ (W @ v)
+        u = W @ v
+        v_new = W.T @ u
+        v_norm = jnp.sqrt(jnp.sum(v_new ** 2) + 1e-12)
+        return v_new / v_norm, None
+
+    v, _ = jax.lax.scan(power_iter_step, v, None, length=num_power_iters)
+
+    # Estimate sigma² = ||W @ v||² (Rayleigh quotient since v is unit norm)
+    u_final = W @ v
+    sigma_sq = jnp.sum(u_final ** 2)
+
+    # Penalty: (σ² - 1)²
+    penalty = (sigma_sq - 1.0) ** 2
+
+    return penalty, sigma_sq

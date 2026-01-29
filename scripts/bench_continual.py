@@ -342,6 +342,7 @@ def create_ppo_config(
     use_nap_layernorm: bool = False,  # NaP: LayerNorm before activations (non-learnable)
     scale_enabled: bool = False,  # Scale-AdaMO: per-layer learnable α
     scale_reg_coeff: Optional[float] = 0.01,  # Scale-AdaMO: log(α)² regularization
+    wsn_coeff: Optional[float] = None,  # WSN (Weight Spectral Norm) regularization coefficient
 ) -> Dict:
     """Create PPO configuration dict."""
     if network_type == "cnn":
@@ -407,6 +408,10 @@ def create_ppo_config(
         config["scale_enabled"] = True
         if scale_reg_coeff is not None:
             config["scale_reg_coeff"] = scale_reg_coeff
+
+    # WSN (Weight Spectral Norm) regularization
+    if wsn_coeff is not None:
+        config["wsn_coeff"] = wsn_coeff
 
     # Calculate total gradient steps per game (used by multiple schedules)
     iteration_steps = num_envs * num_steps
@@ -710,6 +715,24 @@ EXPERIMENT_CONFIGS_MLP = [
         "learning_rate": 2.5e-4,
         "num_minibatches": 128,
         "use_bias": False,  # Paper: "we remove bias terms as these are made redundant by the learnable offset"
+        "use_orthogonal_init": True,
+    },
+    # ==========================================================================
+    # WSN: Weight Spectral Norm regularization (Lewandowski et al. 2025)
+    # ==========================================================================
+    # Drives squared spectral norm towards 1: (σ²(W) - 1)²
+    # Encourages weights to have spectral norm close to 1
+    {
+        "name": "mlp_wsn_small",
+        "network_type": "mlp",
+        "hidden_layer_sizes": (64, 64, 64, 64),
+        "wsn_coeff": 0.001,  # Regularization strength
+        "ortho_mode": None,
+        "activation": "relu",
+        "lr_schedule": "constant",
+        "learning_rate": 2.5e-4,
+        "num_minibatches": 128,
+        "use_bias": True,
         "use_orthogonal_init": True,
     },
     # ==========================================================================
@@ -1118,6 +1141,7 @@ class ContinualTrainer:
             use_nap_layernorm=self.experiment_config.get("use_nap_layernorm", False),
             scale_enabled=self.experiment_config.get("scale_enabled", False),
             scale_reg_coeff=self.experiment_config.get("scale_reg_coeff", 0.01),
+            wsn_coeff=self.experiment_config.get("wsn_coeff"),
         )
         return PPO.create(**config)
 
@@ -1475,6 +1499,7 @@ def create_ppo_for_game_with_config(
         use_nap_layernorm=experiment_config.get("use_nap_layernorm", False),
         scale_enabled=experiment_config.get("scale_enabled", False),
         scale_reg_coeff=experiment_config.get("scale_reg_coeff", 0.01),
+        wsn_coeff=experiment_config.get("wsn_coeff"),
     )
     return PPO.create(**config)
 
